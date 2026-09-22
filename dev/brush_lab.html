@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Spiralist brush lab</title>
+<style>body{margin:0;background:#bbb;font:12px system-ui}</style>
+<script>
+  // Brush tuning without disturbing other contributors: ?wip=1 remaps the engine's brush module
+  // to dev/brush_wip.js through an import map (must exist before any module loads).
+  // ?tool=lab runs the shared dev/lab.js with the same mapping; default is dev/brush_lab.js.
+  (() => {
+    // ?shaders=fix also swaps in dev/brush_shaders_fix.js (engine fix proposals, measured here).
+    const q = new URLSearchParams(location.search);
+    const imports = {};
+    if (q.get('wip') === '1') imports['/js/brushes.js'] = '/dev/brush_wip.js';
+    if (q.get('shaders') === 'fix') imports['/js/shaders.js'] = '/dev/brush_shaders_fix.js';
+    if (Object.keys(imports).length) {
+      const m = document.createElement('script');
+      m.type = 'importmap';
+      m.textContent = JSON.stringify({ imports });
+      document.head.append(m);
+    }
+    const s = document.createElement('script');
+    s.type = 'module';
+    s.src = q.get('tool') === 'lab' ? 'lab.js' : 'brush_lab.js';
+    document.head.append(s);
+  })();
+</script>
+</head>
+<body>
+</body>
+</html>

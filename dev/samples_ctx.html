@@ -1,0 +1,27 @@
+<!doctype html><meta charset="utf-8"><title>samples ctx</title><pre id="log"></pre>
+<script type="module">
+// How much of a "cold" sample is the first WebGL2 context of the page, and does page setup matter?
+const q = new URLSearchParams(location.search);
+const out = {};
+let t0 = performance.now();
+if (q.get('tone')) await import('../js/tone.js');
+out.importTone = +(performance.now() - t0).toFixed(1);
+t0 = performance.now();
+const { makeSample } = await import('../js/samples.js');
+out.importSamples = +(performance.now() - t0).toFixed(1);
+if (q.get('ctx')) {
+  t0 = performance.now();
+  const gl = document.createElement('canvas').getContext('webgl2');
+  gl.getParameter(gl.MAX_TEXTURE_SIZE);
+  out.firstContext = +(performance.now() - t0).toFixed(1);
+}
+if (q.get('wait')) await new Promise(r => setTimeout(r, +q.get('wait')));
+for (const id of ['bust', 'moon', 'cat', 'peaks']) {
+  t0 = performance.now();
+  const c = await makeSample(id, 1024);
+  c.getContext('2d').getImageData(0, 0, 1, 1);
+  out[id] = +(performance.now() - t0).toFixed(1);
+}
+document.getElementById('log').textContent = JSON.stringify(out);
+window.__done = { ok: true, out };
+</script>

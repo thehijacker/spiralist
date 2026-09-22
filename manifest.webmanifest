@@ -1,0 +1,13 @@
+{
+  "name": "Spiralist — one-line spiral drawings",
+  "short_name": "Spiralist",
+  "description": "Turn any photo into art drawn with one continuous spiral line, and film the drawing.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#e7e3dc",
+  "theme_color": "#e7e3dc",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

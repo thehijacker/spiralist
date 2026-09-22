@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Spiralist samples tests</title>
+<style>body{margin:0;background:#bbb;font:12px system-ui}pre{margin:8px;white-space:pre-wrap}</style>
+</head>
+<body>
+<pre id="log"></pre>
+<script type="module">
+// Browser tests for js/samples.js (run by tests/samples.test.mjs, or open in a browser).
+//   ?release=0 skips the slow tests (21 s idle release, 5 s silent worker).
+import { SAMPLES, makeSample, __dev } from '../js/samples.js';
+import { rasterize, processTone, TONE_DEFAULTS, CROP_DEFAULTS } from '../js/tone.js';
+
+const q = new URLSearchParams(location.search);
+const slow = q.get('release') !== '0';
+const results = [];
+const log = t => { document.getElementById('log').textContent += t + '\n'; };
+async function test(name, fn) {
+  const t0 = performance.now();
+  try {
+    const info = await fn();
+    results.push({ name, ok: true, ms: +(performance.now() - t0).toFixed(1), info });
+    log(`PASS ${name}${info ? ' ' + JSON.stringify(info) : ''}`);
+  } catch (e) {
+    results.push({ name, ok: false, error: String(e && e.message || e) });
+    log(`FAIL ${name}: ${e && e.message || e}`);
+  }
+}
+const assert = (c, msg) => { if (!c) throw new Error(msg); };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const pixels = c => c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+function lumaStats(c) {
+  const d = pixels(c);
+  let s = 0, s2 = 0, amin = 255;
+  const n = d.length / 4;
+  for (let i = 0; i < d.length; i += 4) {
+    const l = (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255;
+    s += l; s2 += l * l; amin = Math.min(amin, d[i + 3]);
+  }
+  const mean = s / n;
+  return { mean: +mean.toFixed(3), std: +Math.sqrt(Math.max(0, s2 / n - mean * mean)).toFixed(3), amin };
+}
+// darkest pixel in a small square (fractions of the canvas)
+function minLuma(c, fx, fy, fr) {
+  const S = c.width, r = Math.max(1, Math.round(S * fr));
+  const d = c.getContext('2d').getImageData(Math.round(fx * S) - r, Math.round(fy * S) - r, 2 * r, 2 * r).data;
+  let m = 1;
+  for (let i = 0; i < d.length; i += 4) m = Math.min(m, (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255);
+  return +m.toFixed(3);
+}
+// mean luma of a small square (fractions of the canvas) — for composition checks
+function patch(c, fx, fy, fr = 0.03) {
+  const S = c.width, r = Math.max(1, Math.round(S * fr));
+  const d = c.getContext('2d').getImageData(Math.round(fx * S) - r, Math.round(fy * S) - r, 2 * r, 2 * r).data;
+  let s = 0;
+  for (let i = 0; i < d.length; i += 4) s += (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) / 255;
+  return +(s / (d.length / 4)).toFixed(3);
+}
+function diff(a, b) {
+  const da = pixels(a), db = pixels(b);
+  let n = 0, sum = 0, max = 0;
+  for (let i = 0; i < da.length; i++) { const d = Math.abs(da[i] - db[i]); if (d) n++; sum += d; if (d > max) max = d; }
+  return { bytes: n, mean: +(sum / da.length).toFixed(3), max };
+}
+// Longest stall of the main thread while `fn` runs (a 4 ms heartbeat).
+async function stalls(fn) {
+  let last = performance.now(), max = 0;
+  const iv = setInterval(() => { const n = performance.now(); max = Math.max(max, n - last); last = n; }, 4);
+  try { const r = await fn(); return { r, maxGap: Math.round(max) }; } finally { clearInterval(iv); }
+}
+async function expectError(p) { try { await p; } catch (e) { return e; } return null; }
+
+// A stand-in for window.Worker: runs `prelude` inside the worker, then loads the real module
+// under the real name — to break or instrument the worker from outside.
+const RealWorker = window.Worker;
+function wrapWorker(prelude, { load = true } = {}) {
+  return class extends RealWorker {
+    constructor(url, opts) {
+      const src = prelude + (load ? `\nawait import(${JSON.stringify(String(url))});` : '');
+      super(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })), opts);
+      window.__lastWorker = this;
+    }
+  };
+}
+function fresh() { __dev.reset(); window.Worker = RealWorker; }
+
+// Context-loss injection (a driver reset / TDR): lose the context after the next N draws or links.
+const LOSS = `
+  const P = WebGL2RenderingContext.prototype;
+  const draw = P.drawArrays, link = P.linkProgram;
+  self.__arms = self.__arms || { draw: 0, link: 0 };
+  P.drawArrays = function (...a) { const r = draw.apply(this, a); if (self.__arms.draw > 0 && !this.isContextLost()) { self.__arms.draw--; this.getExtension('WEBGL_lose_context').loseContext(); } return r; };
+  P.linkProgram = function (...a) { const r = link.apply(this, a); if (self.__arms.link > 0 && !this.isContextLost()) { self.__arms.link--; this.getExtension('WEBGL_lose_context').loseContext(); } return r; };
+`;
+
+// ------------------------------------------------------------------------------------ tests
+await test('no WebGL2 at all: rejects with a clear error and code "webgl2"', async () => {
+  fresh();
+  const orig = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function (type, ...rest) { return type === 'webgl2' ? null : orig.call(this, type, ...rest); };
+  window.Worker = undefined;
+  try {
+    const err = await expectError(makeSample('bust', 64));
+    assert(err, 'did not reject');
+    assert(err.code === 'webgl2', `code was ${err.code}`);
+    assert(/WebGL2/.test(err.message), `message: ${err.message}`);
+    return { message: err.message };
+  } finally {
+    HTMLCanvasElement.prototype.getContext = orig;
+    fresh();
+  }
+});
+
+await test('SAMPLES metadata', () => {
+  assert(Array.isArray(SAMPLES) && SAMPLES.length === 4, 'need 4 samples');
+  assert(SAMPLES[0].id === 'bust', 'first (default demo) must be the bust');
+  assert(new Set(SAMPLES.map(s => s.id)).size === 4, 'ids must be unique');
+  for (const s of SAMPLES) {
+    assert(typeof s.name === 'string' && s.name.length > 2, `name for ${s.id}`);
+    assert(typeof s.alt === 'string' && s.alt.length > 20, `alt for ${s.id}`);
+  }
+  return SAMPLES.map(s => s.id);
+});
+
+const timing = {};
+await test('cold generation never blocks the page (compile + render at 1024)', async () => {
+  // As in the app: its own renderer has created a WebGL2 context and the page has settled.
+  const warm = document.createElement('canvas').getContext('webgl2');
+  warm.getParameter(warm.MAX_TEXTURE_SIZE);
+  await sleep(1000);
+  fresh();
+  const gaps = {};
+  for (const { id } of SAMPLES) {
+    const t0 = performance.now();
+    const { maxGap } = await stalls(async () => {
+      const p = makeSample(id, 1024);
+      timing[id + 'CallMs'] = +(performance.now() - t0).toFixed(1);   // time before the promise
+      await p;
+    });
+    timing[id] = +(performance.now() - t0).toFixed(1);
+    gaps[id] = maxGap;
+  }
+  const engine = __dev.engine();
+  // Latency depends on the GPU and on machine load (see report); this only guards against a
+  // gross regression. The page staying responsive is the real contract.
+  const slowOnes = SAMPLES.filter(({ id }) => timing[id] > 3000).map(s => s.id);
+  assert(!slowOnes.length, `over 3 s: ${slowOnes}`);
+  assert(SAMPLES.every(({ id }) => timing[id + 'CallMs'] < 20), 'makeSample blocked before returning its promise');
+  if (engine === 'worker') assert(Object.values(gaps).every(g => g < 100), `main thread stalled: ${JSON.stringify(gaps)}`);
+  return { engine, ms: Object.fromEntries(SAMPLES.map(({ id }) => [id, timing[id]])), maxGapMs: gaps };
+});
+
+await test('default size is 1024, canvases are HTMLCanvasElement', async () => {
+  const c = await makeSample('moon');
+  assert(c instanceof HTMLCanvasElement, 'not an HTMLCanvasElement');
+  assert(c.width === 1024 && c.height === 1024, `${c.width}x${c.height}`);
+});
+
+await test('exact output sizes (1, 7, 16, 97, 256, 1000, 2049; "512"; 15.4 -> 15)', async () => {
+  for (const size of [1, 7, 16, 97, 256, 1000, 2049]) {
+    const c = await makeSample('peaks', size);
+    assert(c.width === size && c.height === size, `${size}: got ${c.width}x${c.height}`);
+    assert(lumaStats(c).amin === 255, `${size}: not opaque`);
+  }
+  const s = await makeSample('peaks', '512');
+  assert(s.width === 512, `"512" gave ${s.width}`);
+  const r = await makeSample('peaks', 15.4);
+  assert(r.width === 15, `15.4 gave ${r.width}`);
+  const big = await makeSample('bust', 2049);
+  assert(lumaStats(big).std > 0.1, 'large bust render is flat');
+});
+
+await test('bad sizes throw a RangeError (0, -5, 0.4, NaN, Infinity, "abc", 8193)', async () => {
+  const out = {};
+  for (const size of [0, -5, 0.4, NaN, Infinity, 'abc', 8193]) {
+    const err = await expectError(makeSample('moon', size));
+    assert(err instanceof RangeError, `${String(size)}: ${err ? err.constructor.name + ' ' + err.message : 'resolved'}`);
+    out[String(size)] = 'RangeError';
+  }
+  const d = await makeSample('moon', undefined);
+  assert(d.width === 1024, 'undefined must mean the default');
+  return out;
+});
+
+await test('strong, readable tonal structure (auto-tone std inside the art circle)', async () => {
+  const out = {};
+  for (const { id } of SAMPLES) {
+    const src = await makeSample(id, 1024);
+    const tone = processTone(rasterize(src, CROP_DEFAULTS), TONE_DEFAULTS, { flip: false });
+    out[id] = { std: +tone.stats.std.toFixed(3), gamma: +tone.stats.gamma.toFixed(2), ...lumaStats(src) };
+    assert(!tone.stats.flat && tone.stats.std > 0.15, `${id} too flat: std ${tone.stats.std}`);
+  }
+  return out;
+});
+
+await test('composition sanity (subject vs background)', async () => {
+  const moon = await makeSample('moon', 512), cat = await makeSample('cat', 512);
+  const peaks = await makeSample('peaks', 512), bust = await makeSample('bust', 512);
+  const r = {
+    moonCorner: patch(moon, 0.05, 0.05), moonCentre: patch(moon, 0.5, 0.62),
+    catCorner: patch(cat, 0.08, 0.08), catPupil: minLuma(cat, 0.394, 0.415, 0.015),
+    peaksSun: patch(peaks, 0.5, 0.45, 0.02), peaksBesideSun: patch(peaks, 0.3, 0.45, 0.02),
+    peaksZenith: patch(peaks, 0.5, 0.04), peaksGround: patch(peaks, 0.5, 0.97),
+    bustForehead: patch(bust, 0.42, 0.35), bustNoseShadow: patch(bust, 0.51, 0.56, 0.01),
+  };
+  assert(r.moonCorner < 0.05 && r.moonCentre > 0.5, 'moon: black sky, bright disc');
+  assert(r.catCorner > 0.6 && r.catPupil < 0.15, 'cat: pale backdrop, dark pupil ' + JSON.stringify(r));
+  assert(r.peaksSun > 0.9 && r.peaksSun > r.peaksBesideSun + 0.35 && r.peaksSun > r.peaksZenith + 0.6 && r.peaksGround < 0.15,
+    'peaks: the sun is the one bright shape, in a darker sky, over dark ground ' + JSON.stringify(r));
+  assert(r.bustForehead > r.bustNoseShadow + 0.2, 'bust: lit forehead vs nose shadow');
+  return r;
+});
+
+await test('deterministic: two fresh renders are byte-identical', async () => {
+  const out = {};
+  for (const { id } of SAMPLES) {
+    const a = await makeSample(id, 300);
+    const b = await makeSample(id, 300, { view: [0, 0, 0, 0] });   // same image, bypasses the cache
+    out[id] = diff(a, b).bytes;
+    assert(out[id] === 0, `${id}: ${out[id]} bytes differ`);
+  }
+  return { engine: __dev.engine(), differingBytes: out };
+});
+
+await test('main-thread fallback: deterministic and matches the worker render', async () => {
+  const out = {};
+  for (const { id } of SAMPLES) {
+    const w = await makeSample(id, 300);
+    const m1 = await makeSample(id, 300, { view: [0], engine: 'main' });
+    const m2 = await makeSample(id, 300, { view: [0, 0], engine: 'main' });
+    const same = diff(m1, m2), vsWorker = diff(w, m1);
+    out[id] = { mainRepeatBytes: same.bytes, vsWorkerMeanDiff: vsWorker.mean, vsWorkerMax: vsWorker.max };
+    assert(same.bytes === 0, `${id}: main renders differ`);
+    assert(vsWorker.mean < 0.5, `${id}: worker and main differ (mean ${vsWorker.mean})`);
+  }
+  return out;
+});
+
+await test('callers get independent copies (mutating one never leaks)', async () => {
+  const a = await makeSample('cat', 200);
+  const g = a.getContext('2d'); g.fillStyle = '#f00'; g.fillRect(0, 0, 200, 200);
+  const b = await makeSample('cat', 200);
+  const d = b.getContext('2d').getImageData(100, 100, 1, 1).data;
+  assert(!(d[0] === 255 && d[1] === 0 && d[2] === 0), 'cached master was modified through a returned canvas');
+  assert(a !== b, 'same canvas returned twice');
+});
+
+await test('unknown id rejects clearly', async () => {
+  let err = await expectError(makeSample('nope', 64));
+  assert(err && /nope/.test(err.message), `got ${err && err.message}`);
+  err = await expectError(makeSample('toString', 64));
+  assert(err, 'prototype keys must not count as samples');
+});
+
+await test('concurrent requests all resolve correctly; identical ones get separate canvases', async () => {
+  const sizes = [120, 130, 140, 150];
+  const cs = await Promise.all([...SAMPLES.map((s, i) => makeSample(s.id, sizes[i])), makeSample('bust', 120)]);
+  cs.slice(0, 4).forEach((c, i) => assert(c.width === sizes[i] && lumaStats(c).std > 0.05, `sample ${i}`));
+  assert(cs[4] !== cs[0] && diff(cs[4], cs[0]).bytes === 0, 'identical concurrent calls: separate canvases, same pixels');
+});
+
+await test('priority: the big image the user waits for comes before a burst of thumbnails', async () => {
+  fresh();                                             // nothing compiled yet, as at app start
+  const order = [];
+  const all = [...SAMPLES.map(s => makeSample(s.id, 128).then(() => order.push(s.id + '@128'))),
+    makeSample('bust', 1024).then(() => order.push('bust@1024'))];
+  await Promise.all(all);
+  assert(order.indexOf('bust@1024') < order.indexOf('moon@128') && order.indexOf('bust@1024') < order.indexOf('cat@128'),
+    `order: ${order}`);
+  return { engine: __dev.engine(), order };
+});
+
+await test('worker without WebGL2 on OffscreenCanvas: the main thread takes over', async () => {
+  if (!RealWorker || typeof OffscreenCanvas === 'undefined') return { skipped: 'no OffscreenCanvas here: main thread already' };
+  fresh();
+  window.Worker = wrapWorker(`const g = OffscreenCanvas.prototype.getContext;
+    OffscreenCanvas.prototype.getContext = function (t, ...r) { return t === 'webgl2' ? null : g.call(this, t, ...r); };`);
+  try {
+    const c = await makeSample('moon', 200);
+    assert(lumaStats(c).std > 0.1 && __dev.engine() === 'main', `engine ${__dev.engine()}`);
+    return { engine: __dev.engine() };
+  } finally { fresh(); }
+});
+
+await test('worker script that fails to load: the main thread takes over', async () => {
+  if (!RealWorker || typeof OffscreenCanvas === 'undefined') return { skipped: 'no OffscreenCanvas here' };
+  fresh();
+  window.Worker = wrapWorker(`throw new Error('broken worker');`, { load: false });
+  try {
+    const c = await makeSample('peaks', 200);
+    assert(lumaStats(c).std > 0.1 && __dev.engine() === 'main', `engine ${__dev.engine()}`);
+  } finally { fresh(); }
+});
+
+if (slow) {
+  await test('silent worker (never says hello): the main thread takes over after 5 s', async () => {
+    if (!RealWorker || typeof OffscreenCanvas === 'undefined') return { skipped: 'no OffscreenCanvas here' };
+    fresh();
+    window.Worker = wrapWorker(`/* never answers */`, { load: false });
+    try {
+      const t0 = performance.now();
+      const c = await makeSample('peaks', 100);
+      assert(lumaStats(c).std > 0.1 && __dev.engine() === 'main', `engine ${__dev.engine()}`);
+      return { ms: Math.round(performance.now() - t0) };
+    } finally { fresh(); }
+  });
+}
+
+// Context loss: once -> retried on a fresh context, the right image; twice -> err.code
+// 'context-lost'; a failed image is never cached.
+async function lossSuite(arm, opts) {
+  const out = {};
+  arm({ draw: 1, link: 0 });
+  const a = lumaStats(await makeSample('cat', 256, opts));
+  assert(a.amin === 255 && a.std > 0.1, 'lost once while drawing: ' + JSON.stringify(a));
+  out.drawOnce = a;
+  arm({ draw: 2, link: 0 });
+  let err = await expectError(makeSample('moon', 256, opts));
+  assert(err && err.code === 'context-lost', 'lost twice while drawing: ' + (err ? err.code + ' ' + err.message : 'resolved'));
+  arm({ draw: 0, link: 0 });
+  const b = lumaStats(await makeSample('moon', 256, opts));
+  assert(b.amin === 255 && b.std > 0.1, 'after a failure the same key renders again: ' + JSON.stringify(b));
+  arm({ draw: 0, link: 1 });
+  const c = lumaStats(await makeSample('peaks', 200, opts));
+  assert(c.amin === 255 && c.std > 0.1, 'lost once while compiling');
+  arm({ draw: 0, link: 2 });
+  err = await expectError(makeSample('bust', 200, opts));
+  assert(err && err.code === 'context-lost', 'lost twice while compiling: ' + (err && err.code));
+  arm({ draw: 0, link: 0 });
+  out.recovered = lumaStats(await makeSample('bust', 200, opts)).std > 0.1;
+  assert(out.recovered, 'renders again after losses');
+  return out;
+}
+
+await test('context lost while drawing or compiling (main thread)', async () => {
+  fresh();
+  new Function(LOSS.replaceAll('self.', 'window.'))();   // stays installed, disarmed afterwards
+  try {
+    return await lossSuite(arms => { window.__arms = arms; }, { engine: 'main' });
+  } finally {
+    window.__arms = { draw: 0, link: 0 };
+    fresh();
+  }
+});
+
+await test('context lost while drawing or compiling (worker)', async () => {
+  if (!RealWorker || typeof OffscreenCanvas === 'undefined') return { skipped: 'no OffscreenCanvas here' };
+  fresh();
+  window.Worker = wrapWorker(LOSS + `self.addEventListener('message', e => { if (e.data && e.data.type === 'arm') self.__arms = e.data.arms; });`);
+  try {
+    await makeSample('peaks', 64);                       // the worker is up
+    assert(__dev.engine() === 'worker', 'worker did not start');
+    return await lossSuite(arms => window.__lastWorker.postMessage({ type: 'arm', arms }), { engine: 'worker' });
+  } finally { fresh(); }
+});
+
+if (slow) {
+  await test('idle release (20 s): the context goes back where compiles are cheap, programs stay where they block', async () => {
+    fresh();
+    // count links where the samples render (worker or main thread)
+    const COUNT = G => `const P = WebGL2RenderingContext.prototype, link = P.linkProgram; ${G}.__links = 0; ${G}.__parallel = null;
+      P.linkProgram = function (...a) { ${G}.__links++; if (${G}.__parallel === null) ${G}.__parallel = !!this.getExtension('KHR_parallel_shader_compile'); return link.apply(this, a); };`;
+    let count;
+    if (RealWorker && typeof OffscreenCanvas !== 'undefined') {
+      window.Worker = wrapWorker(COUNT('self') + `
+        self.addEventListener('message', e => { if (e.data && e.data.type === 'count') postMessage({ type: 'count', links: self.__links, parallel: self.__parallel }); });`);
+      count = () => new Promise(r => {
+        const w = window.__lastWorker;
+        const f = e => { if (e.data.type === 'count') { w.removeEventListener('message', f); r(e.data); } };
+        w.addEventListener('message', f); w.postMessage({ type: 'count' });
+      });
+    } else {
+      new Function(COUNT('window'))();
+      count = async () => ({ links: window.__links, parallel: window.__parallel });
+    }
+    try {
+      const t0 = performance.now();
+      await makeSample('cat', 300);
+      const cold = performance.now() - t0;
+      await sleep(5000);                                   // background compiles of the others end
+      const before = await count();
+      await sleep(21000);                                  // 20 s with no GPU work: released
+      const t1 = performance.now();
+      const { r: c, maxGap } = await stalls(() => makeSample('cat', 333));
+      const ms = +(performance.now() - t1).toFixed(1);
+      const after = await count();
+      assert(lumaStats(c).std > 0.1 && lumaStats(c).amin === 255, 'blank after release');
+      const relinks = after.links - before.links;
+      if (before.parallel) assert(relinks === 1, `parallel compile: expected the context released and 1 relink, got ${relinks}`);
+      else assert(relinks === 0, `no parallel compile: programs must be kept, got ${relinks} relinks`);
+      if (__dev.engine() === 'worker') assert(maxGap < 100, `main thread stalled ${maxGap} ms after release`);
+      return { engine: __dev.engine(), parallel: before.parallel, linksBefore: before.links, relinks, coldMs: Math.round(cold), afterIdleMs: ms, maxGapMs: maxGap };
+    } finally { fresh(); }
+  });
+}
+
+const ok = results.every(r => r.ok);
+window.__done = { ok, results, timing };
+</script>
+</body>
+</html>

@@ -1,0 +1,49 @@
+<!doctype html><meta charset="utf-8"><title>samples compile</title><pre id="log"></pre>
+<script type="module">
+// Compile-time attribution: link each shader (or a variant of it) in a fresh context.
+import { __dev } from '../js/samples.js';
+const q = new URLSearchParams(location.search);
+const variants = {
+  full: s => s,
+  noHair: s => s.replace(/float hairSd\(vec3 p, float cap\) \{[\s\S]*?\n\}/, 'float hairSd(vec3 p, float cap) { return cap; }'),
+  sphereMap: s => s.replace(/vec2 mapBust\(vec3 p\) \{[\s\S]*?return vec2\(d, hairMat\);\n\}/, 'vec2 mapBust(vec3 p) { return vec2(length(p) - 8.0, 0.0); }'),
+  noRoundCone: s => s.replace(/sdRoundCone\(p, vec3\(0\.0, 0\.5, 9\.2\), vec3\(0\.0, -3\.7, 11\.3\), 0\.55, 0\.62\)/, 'sdCapsule(p, vec3(0.0, 0.5, 9.2), vec3(0.0, -3.7, 11.3), 0.6)').replace(/sdRoundCone\(p, vec3\(0\.0, -22\.0, 0\.3\), vec3\(0\.0, -7\.5, -2\.4\), 5\.9, 5\.2\)/, 'sdCapsule(p, vec3(0.0, -22.0, 0.3), vec3(0.0, -7.5, -2.4), 5.5)'),
+  noCatFur: s => s.replace(/if \(d < 0\.6\) d -= [^;]*;/, ''),
+  noCoat: s => s.replace(/vec3 coat\(vec3 p, float earIn\) \{[\s\S]*?\n\}/, 'vec3 coat(vec3 p, float earIn) { return vec3(0.3); }'),
+  noEars: s => s.replace(/vec2 ears\(vec3 q\) \{[\s\S]*?\n\}/, 'vec2 ears(vec3 q) { return vec2(length(q - EAR_B) - 1.0, 0.0); }'),
+  noIris: s => s.replace(/vec3 irisColor\(vec3 e\) \{[\s\S]*?\n\}/, 'vec3 irisColor(vec3 e) { return vec3(0.3); }'),
+  oldEars: s => s.replace(/vec2 ears\(vec3 q\) \{[\s\S]*?\n\}/, `vec2 ears(vec3 q) {
+  vec3 v = q - EAR_B;
+  float outer = sdTaper(EAR_B + v + EAR_F * dot(v, EAR_F) * 1.4, EAR_B, EAR_T, 1.8, 0.16) / 2.4;
+  vec3 vi = v - EAR_F * 0.55;
+  float inner = sdTaper(EAR_B + vi + EAR_F * dot(vi, EAR_F) * 1.4, EAR_B + vec3(0.1, 0.3, 0.0), EAR_T - vec3(0.05, 0.35, 0.0), 1.35, 0.05) / 2.4;
+  return vec2(smax(outer, -inner, 0.25), step(outer, -inner));
+}`),
+  catSphere: s => s.replace(/vec2 mapCat\(vec3 p\) \{[\s\S]*?\n\}/, 'vec2 mapCat(vec3 p) { return vec2(length(p) - 4.0, 0.0); }'),
+};
+const jobs = (q.get('jobs') || 'bust:full,bust:noHair,bust:sphereMap,bust:noRoundCone,cat:full,cat:noCatFur,cat:noCoat,moon:full,peaks:full').split(',');
+const report = [];
+for (const job of jobs) {
+  const [id, v] = job.split(':');
+  // a unique comment defeats the browser's program cache, so repeats measure a real compile
+  const src = variants[v](__dev.SHADERS[id]) + `
+// ${Math.random()}
+`;
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const gl = c.getContext('webgl2');
+  const t0 = performance.now();
+  const vs = gl.createShader(gl.VERTEX_SHADER); gl.shaderSource(vs, __dev.VERT); gl.compileShader(vs);
+  const fs = gl.createShader(gl.FRAGMENT_SHADER); gl.shaderSource(fs, src); gl.compileShader(fs);
+  const p = gl.createProgram(); gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  const ok = gl.getProgramParameter(p, gl.LINK_STATUS);
+  const t1 = performance.now();
+  report.push({ job, ok, linkMs: +(t1 - t0).toFixed(1), log: ok ? '' : gl.getShaderInfoLog(fs).slice(0, 200) });
+  gl.getExtension('WEBGL_lose_context').loseContext();
+}
+const avg = {};
+for (const r of report) (avg[r.job] ||= []).push(r.linkMs);
+const summary = Object.fromEntries(Object.entries(avg).map(([k, v]) => [k, +(v.reduce((a, b) => a + b, 0) / v.length).toFixed(1)]));
+report.push({ summary });
+document.getElementById('log').textContent = JSON.stringify(report, null, 1);
+window.__done = { ok: true, report };
+</script>

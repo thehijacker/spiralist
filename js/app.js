@@ -18,6 +18,7 @@ import { History } from './history.js';
 import { sliderRow, bindSeg, rovingGrid, setChecked, popover, toast, announce, fmtTime, reducedMotion, isTouch, paintRange } from './ui.js';
 import { Thumbs } from './thumbs.js';
 import { drawSeconds, drawProgress } from './film.js';
+import { starCount } from './share.js';
 
 const $ = id => document.getElementById(id);
 const LAYOUT = Object.freeze({ cx: 0.5, cy: 0.5, r: 0.42 });
@@ -1434,6 +1435,12 @@ async function boot() {
       } catch (e) { toast(imageErrorMessage(e), { error: true }); }
     }, { once: true });
   }
+  starCount().then(n => {
+    if (n == null) return;
+    const el = $('starCount');
+    el.textContent = n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+    el.hidden = false;
+  });
   // the first thing a visitor sees: a sample drawing itself behind the welcome card
   const ok = await openSample('bust', { announceIt: false });
   if (!ok) { renderer.renderBlank(); }

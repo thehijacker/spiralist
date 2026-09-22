@@ -2,6 +2,7 @@
 // filled outline, plotter fill), plus copy-to-clipboard. Choices are remembered; Ctrl+S reuses them.
 
 import { bindSeg, toast, announce } from './ui.js';
+import { shareToX } from './share.js';
 
 export function createDownloadDialog(app) {
   const $ = id => document.getElementById(id);
@@ -125,6 +126,17 @@ export function createDownloadDialog(app) {
     // ClipboardItem must be created synchronously inside the click (Safari), fed a promise.
     const ok = await exp.copyPNG(exp.exportPNG(st, { size: 2048, transparent: false }));
     toast(ok ? 'Copied the drawing to the clipboard.' : 'This browser blocked copying — use Download instead.', { error: !ok });
+  });
+
+  $('dlShareX').addEventListener('click', async () => {
+    if (!exp) return;
+    const st = app.renderState();
+    const name = exp.fileName([...baseName(), '2048'], 'png');
+    // opens the X post synchronously (popup blockers), then saves the image to attach
+    const out = await shareToX(() => exp.exportPNG(st, { size: 2048, transparent: false }), {
+      filename: name, kind: 'image', mime: 'image/png', download: exp.downloadBlob, canShare: exp.canShareFiles,
+    });
+    if (out === 'intent') toast('Image saved — attach it to your post on X.');
   });
 
   return {

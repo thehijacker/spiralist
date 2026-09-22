@@ -7,7 +7,7 @@ const SHELL = [
   './', './index.html', './css/app.css', './manifest.webmanifest', './icon.svg', './vendor/mp4-muxer.mjs',
   './js/app.js', './js/brushes.js', './js/download.js', './js/encoder.js', './js/export.js', './js/film.js',
   './js/freeline.js', './js/history.js', './js/imageio.js', './js/materials.js', './js/maze.js', './js/papers.js',
-  './js/renderer.js', './js/samples.js', './js/scene.js', './js/shaders.js', './js/spiral.js', './js/store.js',
+  './js/renderer.js', './js/samples.js', './js/scene.js', './js/share.js', './js/shaders.js', './js/spiral.js', './js/store.js',
   './js/thumbs.js', './js/tone.js', './js/tools.js', './js/ui.js',
 ];
 

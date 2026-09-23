@@ -18,6 +18,8 @@ const types = {
   '.webp': 'image/webp', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.txt': 'text/plain; charset=utf-8',
   '.md': 'text/plain; charset=utf-8', '.mp4': 'video/mp4', '.webm': 'video/webm', '.woff2': 'font/woff2',
   '.webmanifest': 'application/manifest+json',
+  // as GitHub Pages sends it: lets onnxruntime and MediaPipe stream-compile (one fetch, no console errors)
+  '.wasm': 'application/wasm',
 };
 const safeName = (n, fallback) => String(n || fallback).replace(/[^a-z0-9_.-]/gi, '_').replace(/^\.+/, '');
 

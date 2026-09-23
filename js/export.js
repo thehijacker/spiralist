@@ -1115,15 +1115,24 @@ const mm = v => +v.toFixed(3);
  * <desc> and layer name say which.
  * Default mode: 'stroke' for wave geometry, 'outline' otherwise.
  */
+const LINE_TOOL_NAME = { fountain: 'fountain nib', brush: 'sumi brush', pencil: 'soft pencil', charcoal: 'charcoal pencil', fineliner: 'fineliner', marker: 'marker', ballpoint: 'ballpoint' };
 export function buildSVG(geom, { mode, ink = '#17171a', paper = null, sizeMm = SHEET_MM, layout = DEFAULT_LAYOUT, penMm } = {}) {
   if (!geom || geom.n < 2) throw new Error('buildSVG: no line to export');
   // A realistic drawing IS a plotter file: the real sheet in mm, one path, the real pen width
   // (whatever kind the dialog asks for, an outline or a fill would misstate the pen)
   const real = geom.real && geom.real.toolMm > 0 && geom.real.sheetMm > 0 ? geom.real : null;
   if (real) { mode = 'stroke'; sizeMm = real.sheetMm; penMm = real.toolMm; }
+  // Line art is real size too: one path on the real sheet with the tool's width; a pressure tool
+  // (nib, brush, pencil) may ask for the outline instead, which keeps the swell of the line
+  const la = !real && geom.lineart && geom.lineart.toolMm > 0 ? geom.lineart : null;
+  if (la) {
+    sizeMm = la.sheetMm > 0 ? la.sheetMm : sizeMm;
+    if (!(mode === 'outline' && la.pressure)) { mode = 'stroke'; penMm = la.toolMm; }
+  }
   // the Save dialog names the file right after this call with the kind it asked for; remember the
   // real sheet so fileName says what the file is ('...-real-594mm.svg', not '-outline.svg')
-  lastRealSvg = real ? { sheetMm: real.sheetMm, at: Date.now() } : null;
+  lastRealSvg = real ? { sheetMm: real.sheetMm, at: Date.now() }
+    : la ? { sheetMm: sizeMm, at: Date.now(), kind: 'lineart', mode } : null;
   mode = mode || (geom.technique === 'wave' ? 'stroke' : 'outline');
   if (!['stroke', 'outline', 'plotter'].includes(mode)) throw new Error('buildSVG: unknown mode ' + mode);
   const S = Math.max(1, +sizeMm || SHEET_MM);
@@ -1146,6 +1155,7 @@ export function buildSVG(geom, { mode, ink = '#17171a', paper = null, sizeMm = S
   const lengthM = (geom.length || 0) * m.R / 1000;
   const kind = geom.path || 'spiral';
   const what = real ? `line, ${String(real.name || real.style || 'drawing').toLowerCase()} for a ${mm(real.toolMm)} mm pen (about ${Math.max(1, Math.round((real.handSeconds || 0) / 60))} min by hand)`
+    : la ? `one-line drawing (${String(la.name || la.style || 'line art').toLowerCase()}) for a ${mm(la.toolMm)} mm ${LINE_TOOL_NAME[la.tool] || la.tool || 'pen'} (about ${Math.max(1, Math.round((la.handSeconds || 0) / 60))} min by hand)`
     : kind === 'spiral' ? `spiral of ${Math.round(geom.turns ?? geom.rings ?? 0)} turns`
     : kind === 'maze' ? `line winding through a ${geom.shape === 'circle' ? 'round' : 'square'} maze ${Math.round(geom.rings ?? 0)} corridors across`
     : kind === 'wander' ? 'line wandering across the picture'
@@ -1275,7 +1285,9 @@ export function fileName(parts = [], ext = '') {
   // a realistic SVG was just built: its kind is always a real-size single stroke (see buildSVG)
   if (lastRealSvg && String(ext).replace(/^\.+/, '').toLowerCase() === 'svg' && Date.now() - lastRealSvg.at < 5000
     && ['stroke', 'outline', 'plotter'].includes(parts[parts.length - 1])) {
-    parts = [...parts.slice(0, -1), 'real', `${Math.round(lastRealSvg.sheetMm)}mm`];
+    parts = lastRealSvg.kind === 'lineart'
+      ? [...parts.slice(0, -1), 'lineart', `${Math.round(lastRealSvg.sheetMm)}mm`, ...(lastRealSvg.mode === 'outline' ? ['outline'] : [])]
+      : [...parts.slice(0, -1), 'real', `${Math.round(lastRealSvg.sheetMm)}mm`];
   }
   const slug = s => String(s ?? '').normalize('NFKD').replace(COMBINING_MARKS, '').toLowerCase()
     .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');

@@ -116,6 +116,12 @@
         <canvas id="overlay" class="overlay" aria-hidden="true"></canvas>
         <div class="busy" id="busy" hidden><span class="spinner" aria-hidden="true"></span></div>
         <div class="real-scale" id="realScale" hidden><span class="real-scale-rule"><i></i><b id="realScaleLen">5 cm</b></span><span class="real-scale-txt" id="realScaleTxt"></span></div>
+        <!-- Line art, first use: the model download, then reading the photo (real progress) -->
+        <div class="line-gate" id="lineGate" role="status" hidden>
+          <div class="line-gate-title" id="lineGateTitle">Getting the line model ready</div>
+          <div class="line-gate-sub" id="lineGateSub">45 MB, once, then it works offline</div>
+          <div class="line-gate-bar" role="progressbar" aria-labelledby="lineGateTitle" aria-valuemin="0" aria-valuemax="100" id="lineGateBar"><i></i></div>
+        </div>
         <!-- loupe: shown while zoomed; the scale bar is real paper (the sheet's true width) -->
         <div class="loupe-bar" id="loupeBar" role="toolbar" aria-label="Zoom" hidden>
           <button class="loupe-btn" type="button" id="loupeOut" aria-label="Zoom out" title="Zoom out (−)">
@@ -203,7 +209,8 @@
     <div class="mode-bar">
       <div class="seg mode-seg" data-bind="mode" role="radiogroup" aria-label="Mode">
         <button role="radio" type="button" data-v="artistic" title="Artistic: the line swells and wiggles freely (M)">Artistic</button>
-        <button role="radio" type="button" data-v="realistic" title="Realistic: one real pen on a real sheet, drawable by hand (M)">Realistic</button>
+        <button role="radio" type="button" data-v="realistic" title="Realistic: plotter styles, tone from line density, one real pen on a real sheet (M)">Realistic</button>
+        <button role="radio" type="button" data-v="lineart" title="Line art: contours drawn feature by feature, the way one-line artists draw (M)">Line art</button>
       </div>
     </div>
     <nav class="tabs" id="tabs" role="tablist" aria-label="Settings sections">
@@ -216,6 +223,7 @@
     <div class="panels" id="panels">
       <section class="panel real-only" data-panel="looks" role="tabpanel" aria-labelledby="h-style">
         <header class="panel-head"><h2 id="h-style">Style</h2><span class="head-value" id="styleValue"></span></header>
+        <p class="panel-sub">Plotter styles: one real pen, and the tone comes only from how densely the line packs.</p>
         <p class="stat real-info" id="realInfo" aria-live="polite"></p>
         <div class="styles" id="realStyles" role="radiogroup" aria-label="Style"></div>
         <div class="field-label">Detail</div>
@@ -226,16 +234,32 @@
         </div>
       </section>
 
+      <section class="panel line-only" data-panel="looks" role="tabpanel" aria-labelledby="h-lstyle">
+        <header class="panel-head"><h2 id="h-lstyle">Style</h2><span class="head-value" id="lineStyleValue"></span></header>
+        <p class="panel-sub">One-line drawings the way artists make them: contours, not tone, drawn feature by feature.</p>
+        <p class="stat real-info" id="lineInfo" aria-live="polite"></p>
+        <p class="hint-card warn line-note" id="lineNote" hidden></p>
+        <div class="styles" id="lineStyles" role="radiogroup" aria-label="Line art style"></div>
+        <div class="sliders" id="lineArtSliders"></div>
+      </section>
+
       <section class="panel artistic-only" data-panel="looks" role="tabpanel" aria-labelledby="h-looks">
         <header class="panel-head"><h2 id="h-looks">Look</h2><span class="head-value" id="lookValue"></span>
           <button class="text-btn" type="button" id="lookRevert" hidden>Revert</button></header>
         <div class="looks" id="looks" role="radiogroup" aria-label="Looks"></div>
+        <p class="helper look-pointer">For a drawing made the way one-line artists work, contour by contour, try <button class="text-btn" type="button" id="tryLineArt">Line art</button>.</p>
       </section>
 
       <section class="panel" data-panel="tool" role="tabpanel" aria-labelledby="h-tool">
         <header class="panel-head"><h2 id="h-tool">Tool</h2><span class="head-value" id="toolValue"></span></header>
         <div class="chips tools artistic-only" id="tools" role="radiogroup" aria-label="Drawing tool"></div>
         <div class="chips tools real-tools real-only" id="realTools" role="radiogroup" aria-label="Drawing tool at its real size"></div>
+        <div class="chips tools real-tools line-only" id="lineTools" role="radiogroup" aria-label="Drawing tool"></div>
+        <div class="line-only" id="lineSizeRow" hidden>
+          <div class="field-label">Line width</div>
+          <div class="seg seg-sm" id="lineSizes" role="radiogroup" aria-label="Line width"></div>
+        </div>
+        <p class="helper line-only" id="lineToolHelp"></p>
         <div class="real-only" id="realSizeRow" hidden>
           <div class="field-label">Line width</div>
           <div class="seg seg-sm" id="realSizes" role="radiogroup" aria-label="Line width"></div>
@@ -256,6 +280,16 @@
           </div>
           <p class="helper" id="sheetHelp"></p>
           <div class="hint-card warn" id="sheetWarn" hidden></div>
+        </div>
+        <div class="line-only">
+          <div class="field-label">Light</div>
+          <div class="seg seg-sm" data-bind="lineLight" role="radiogroup" aria-label="Light">
+            <button role="radio" type="button" data-v="window" title="Soft daylight from the upper left">Window</button>
+            <button role="radio" type="button" data-v="raking" title="Low light across the sheet: paper tooth and grooves show">Raking</button>
+            <button role="radio" type="button" data-v="overhead" title="Flat light from above, like a scanner">Overhead</button>
+          </div>
+        </div>
+        <div class="real-only">
           <div class="field-label">Light</div>
           <div class="seg seg-sm" data-bind="realLight" role="radiogroup" aria-label="Light">
             <button role="radio" type="button" data-v="window" title="Soft daylight from the upper left">Window</button>
@@ -313,7 +347,8 @@
       <section class="panel" data-panel="photo" role="tabpanel" aria-labelledby="h-photo">
         <header class="panel-head"><h2 id="h-photo">Photo</h2>
           <button class="text-btn" type="button" id="photoReset" hidden>Reset</button></header>
-        <div class="pen-sees">
+        <p class="helper line-only">Line art reads the shapes in the photo, not its tones: frame the face or subject so it fills the square.</p>
+        <div class="pen-sees no-line">
           <canvas id="penSees" width="176" height="176" aria-label="What the pen sees: the photo's tones after adjustment" role="img"></canvas>
           <div>
             <div class="pen-sees-title">What the pen sees</div>
@@ -321,9 +356,10 @@
             <button class="btn secondary small" type="button" id="btnFrame2"><svg class="ic" aria-hidden="true"><use href="#i-frame"/></svg>Adjust framing</button>
           </div>
         </div>
-        <label class="switch-row"><span>Auto tone</span><input type="checkbox" class="switch" data-bind="auto"></label>
-        <div class="sliders" id="photoSliders"></div>
-        <label class="switch-row"><span>Invert tones</span><input type="checkbox" class="switch" data-bind="invert"></label>
+        <button class="btn secondary small line-only" type="button" id="btnFrame3"><svg class="ic" aria-hidden="true"><use href="#i-frame"/></svg>Adjust framing</button>
+        <label class="switch-row no-line"><span>Auto tone</span><input type="checkbox" class="switch" data-bind="auto"></label>
+        <div class="sliders no-line" id="photoSliders"></div>
+        <label class="switch-row no-line"><span>Invert tones</span><input type="checkbox" class="switch" data-bind="invert"></label>
         <p class="helper" id="flipNote" hidden>Tones are flipped automatically for light ink on dark paper.</p>
       </section>
     </div>
@@ -368,12 +404,12 @@
     </div>
     <div class="dl-svg" hidden>
       <div class="field-label">Kind</div>
-      <div class="seg artistic-only" data-dl="svgMode" role="radiogroup" aria-label="SVG kind">
+      <div class="seg no-real" data-dl="svgMode" role="radiogroup" aria-label="SVG kind">
         <button role="radio" type="button" data-v="stroke">Single stroke</button>
         <button role="radio" type="button" data-v="outline">Filled outline</button>
         <button role="radio" type="button" data-v="plotter">Plotter fill</button>
       </div>
-      <p class="helper artistic-only" id="dlSvgNote"></p>
+      <p class="helper no-real" id="dlSvgNote"></p>
       <label class="switch-row"><span>Include paper colour</span><input type="checkbox" class="switch" id="dlSvgPaper"></label>
     </div>
     <p class="helper real-note" id="dlRealNote" hidden></p>
@@ -505,12 +541,13 @@
       <dt><kbd>Home</kbd> <kbd>End</kbd></dt><dd>Blank sheet / finished drawing</dd>
       <dt><kbd>\</kbd></dt><dd>Hold to compare with the photo</dd>
       <dt><kbd>F</kbd></dt><dd>Adjust framing</dd>
-      <dt><kbd>M</kbd></dt><dd>Switch Artistic / Realistic</dd>
+      <dt><kbd>M</kbd></dt><dd>Next mode: Artistic, Realistic, Line art</dd>
       <dt><kbd>+</kbd> <kbd>−</kbd> <kbd>0</kbd></dt><dd>Loupe: zoom in / out / whole sheet (or scroll, pinch, double-click)</dd>
       <dt><kbd>R</kbd></dt><dd>Film a timelapse</dd>
       <dt><kbd>1</kbd>–<kbd>9</kbd></dt><dd>Apply a look</dd>
       <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Fewer / more rings</dd>
       <dt><kbd>1</kbd>–<kbd>4</kbd> <kbd>[</kbd> <kbd>]</kbd></dt><dd>Realistic: style A–D / less or more detail</dd>
+      <dt><kbd>1</kbd>–<kbd>4</kbd> <kbd>[</kbd> <kbd>]</kbd></dt><dd>Line art: style A–D / less or more detail</dd>
       <dt><kbd>Ctrl</kbd> <kbd>O</kbd></dt><dd>Open a photo</dd>
       <dt><kbd>Ctrl</kbd> <kbd>V</kbd></dt><dd>Paste an image</dd>
       <dt><kbd>Ctrl</kbd> <kbd>Z</kbd></dt><dd>Undo (Shift: redo)</dd>

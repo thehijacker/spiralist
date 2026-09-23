@@ -27,7 +27,11 @@ export function createDownloadDialog(app) {
   const slug = s => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 24);
   const baseName = () => ['spiralist', slug(app.photo?.name || 'drawing') || 'drawing', slug(app.renderState().brush.name)];
 
-  function svgModeFor(tech) {
+  function svgModeFor(tech, geom = app.renderState().geom) {
+    // Line art is a real-size single path at the tool's width; a pressure tool may keep its swell
+    // as a filled outline instead (the plotter fill is for the spiral's width bands)
+    const la = geom?.lineart;
+    if (la) return la.pressure && d.svgMode === 'outline' ? 'outline' : 'stroke';
     // single stroke only makes sense for the constant-width wave; width techniques get an outline
     if (d.svgMode === 'stroke' && tech !== 'wave') return 'outline';
     return d.svgMode;
@@ -45,17 +49,35 @@ export function createDownloadDialog(app) {
     dlg.querySelector('.dl-png').hidden = !isPng;
     dlg.querySelector('.dl-svg').hidden = isPng;
     $('dlCopy').hidden = !isPng || !exp || typeof ClipboardItem === 'undefined';
-    const cm = (d.size / 300 * 2.54).toFixed(0);
-    $('dlSizeNote').textContent = `${d.size} × ${d.size} px · prints ${cm} × ${cm} cm at 300 dpi`;
+    // Line art and Realistic draw a real sheet: say what the pixels are on that sheet, not a print
+    // size of their own next to the SVG's real size
+    const sheetMm = st.geom?.lineart?.sheetMm || st.geom?.real?.sheetMm;
+    if (sheetMm) {
+      const scm = Math.round(sheetMm / 10), dpi = Math.round(d.size / (sheetMm / 25.4));
+      $('dlSizeNote').textContent = `${d.size} × ${d.size} px · the ${scm} × ${scm} cm sheet at about ${dpi} dpi`;
+    } else {
+      const cm = (d.size / 300 * 2.54).toFixed(0);
+      $('dlSizeNote').textContent = `${d.size} × ${d.size} px · prints ${cm} × ${cm} cm at 300 dpi`;
+    }
     $('dlBgNote').hidden = !(d.background === 'transparent' && st.cover);
     const tech = st.geom?.technique;
-    const mode = svgModeFor(tech);
+    const la = st.geom?.lineart;
+    const mode = svgModeFor(tech, st.geom);
     segs.svgMode.set(mode);
     const strokeBtn = dlg.querySelector('[data-dl="svgMode"] [data-v="stroke"]');
-    strokeBtn.disabled = tech !== 'wave';
-    strokeBtn.title = tech !== 'wave' ? 'Switch the line to Wave for a single constant-width stroke' : '';
+    const outlineBtn = dlg.querySelector('[data-dl="svgMode"] [data-v="outline"]');
+    const plotterBtn = dlg.querySelector('[data-dl="svgMode"] [data-v="plotter"]');
+    strokeBtn.disabled = !la && tech !== 'wave';
+    strokeBtn.title = !la && tech !== 'wave' ? 'Switch the line to Wave for a single constant-width stroke' : '';
+    if (outlineBtn) { outlineBtn.disabled = !!la && !la.pressure; outlineBtn.title = la && !la.pressure ? 'This tool draws one even width: the single stroke is the drawing' : ''; }
+    if (plotterBtn) { plotterBtn.disabled = !!la; plotterBtn.title = la ? 'Not for Line art: it is one open line, so the single stroke is already the plotter file' : ''; }
     const pen = st.geom?.penWidth ? (st.geom.penWidth * 84).toFixed(2) : null;
-    $('dlSvgNote').textContent = mode === 'stroke'
+    if (la) {
+      const mmS = Math.round((la.sheetMm || 210) / 10);
+      $('dlSvgNote').textContent = mode === 'outline'
+        ? `One filled outline that keeps the ${la.toolMm} mm tool's pressure-weighted width, ${mmS} × ${mmS} cm real size.`
+        : `One single path, ${la.toolMm} mm wide, ${mmS} × ${mmS} cm real size — ready for a pen plotter.${la.pressure ? ' Choose Filled outline to keep the pressure-weighted width.' : ''} Plotter fill is off: Line art is already one open line.`;
+    } else $('dlSvgNote').textContent = mode === 'stroke'
       ? `One single stroke${pen ? `, ${pen} mm wide` : ''}, 200 × 200 mm — ready for a pen plotter.`
       : mode === 'plotter'
         ? 'One single stroke that zig-zags to fill the line’s width with a 0.3 mm pen — for plotters.'
@@ -94,7 +116,7 @@ export function createDownloadDialog(app) {
         toast(`Saved ${name}`);
         announce(`Saved ${name}`);
       } else {
-        const mode = svgModeFor(st.geom.technique);
+        const mode = svgModeFor(st.geom.technique, st.geom);
         const svg = exp.buildSVG(st.geom, { mode, ink: st.photoColor ? '#1c1b19' : st.ink, paper: d.svgPaper ? st.paper.color : null, sizeMm: 200, layout: st.layout });
         const stats = exp.svgStats(svg);
         const blob = new Blob([svg], { type: 'image/svg+xml' });

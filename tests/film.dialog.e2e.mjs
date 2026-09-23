@@ -23,7 +23,7 @@ async function boot() {
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
   page.on('console', m => { if (['error'].includes(m.type())) logs.push(`[${m.type()}] ${m.text()}`); });
   page.on('pageerror', e => logs.push('[pageerror] ' + e.message));
-  await page.goto('http://localhost:8830/?v=' + Date.now());
+  await page.goto(`http://localhost:${opt('port', 8830)}/?v=` + Date.now());
   await page.waitForFunction(() => window.SP && window.SP.geom && !window.SP.play.playing, null, { timeout: 60000 });
   return page;
 }
@@ -148,6 +148,42 @@ console.log(`cold open (median of ${runs}): first frame ${median(cold.map(c => c
     const a = await page.evaluate(() => ({ hand: !document.getElementById('filmHand').hidden, reveal: !document.getElementById('filmRevealRow').hidden,
       counter: !document.getElementById('filmCounterRow').hidden }));
     check(!a.hand && a.reveal && !a.counter, `artistic: no hand line, reveal back, no clock row (${JSON.stringify(a)})`);
+    await page.evaluate(() => { SP.prefs.film.length = 15; SP.prefs.film.lengthChosen = false; SP.persist?.(); });
+  }
+  await page.close();
+}
+// Line art (doc.mode 'lineart'): the true drawing at near real speed, 15/30/60 s (no 10 s), 30 s by
+// default, the hand time said to the second, the clock row shown, no reveal
+{
+  const page = await boot();
+  const hasLine = await page.evaluate(() => typeof SP.setLineStyle === 'function');
+  if (!hasLine) console.log('skip  line art dialog: the app has no Line art mode');
+  else {
+    await page.evaluate(() => { SP.prefs.film.lengthChosen = false; SP.prefs.film.length = 15; SP.setMode('lineart'); SP.setLineStyle('matisse'); });
+    await page.waitForFunction(() => SP.geom?.path === 'lineart' && SP.geom.lineart?.style === 'matisse' && !SP.building, null, { timeout: 240000, polling: 250 });
+    await openTimed(page);
+    const r = await page.evaluate(() => {
+      const vis = el => !!el && !el.hidden && el.offsetParent !== null;
+      const lens = [...document.querySelectorAll('#filmDialog [data-film="length"] [data-v]')].filter(vis).map(b => b.dataset.v);
+      const len = document.querySelector('#filmDialog [data-film="length"] [aria-checked="true"]')?.dataset.v;
+      return { hand: document.getElementById('filmHand').textContent, handVis: vis(document.getElementById('filmHand')), lens, len,
+        reveal: vis(document.getElementById('filmRevealRow')), counter: vis(document.getElementById('filmCounterRow')), go: document.getElementById('filmGoLabel').textContent };
+    });
+    check(r.lens.join(',') === '15,30,60', `lengths offered: ${r.lens.join(', ')} s`);
+    check(r.len === '30' && r.go.includes('30-second'), `30 s by default (${r.go})`);
+    check(r.handVis && /^(\d+ s|\d+ min \d\d s) of drawing by hand · shown (about [\d.]+× faster|at real speed) in 30 s$/.test(r.hand), `hand-time line: "${r.hand}"`);
+    check(!r.reveal && r.counter, `no reveal, clock row shown (${JSON.stringify({ reveal: r.reveal, counter: r.counter })})`);
+    await page.click('#filmDialog [data-film="length"] [data-v="60"]');
+    const picked = await page.evaluate(() => ({ len: SP.prefs.film.length, hand: document.getElementById('filmHand').textContent }));
+    check(picked.len === 60 && picked.hand.endsWith('in 60 s'), `60 s picked (${picked.hand})`);
+    await page.locator('#filmDialog').screenshot({ path: 'shots/lf_dialog_lineart.png' });
+    // back to Artistic: 10 s is offered again
+    await page.click('#filmClose');
+    await page.evaluate(() => SP.setMode('artistic'));
+    await page.waitForFunction(() => SP.geom?.path !== 'lineart' && !SP.building, null, { timeout: 60000, polling: 250 });
+    await openTimed(page);
+    const ten = await page.evaluate(() => !document.querySelector('#filmDialog [data-film="length"] [data-v="10"]').hidden);
+    check(ten, 'artistic: 10 s offered again');
     await page.evaluate(() => { SP.prefs.film.length = 15; SP.prefs.film.lengthChosen = false; SP.persist?.(); });
   }
   await page.close();

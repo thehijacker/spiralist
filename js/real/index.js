@@ -83,6 +83,7 @@ export const REAL_STYLES = [
   {
     id: 'squiggle', letter: 'A', name: 'Squiggle spiral',
     blurb: 'One spiral from the centre that zigzags tighter where the photo is dark.',
+    lineage: 'Pen-plotter squiggle, like Tyler Foust’s hand-drawn squiggle portraits.',
     build: buildSquiggle, presets: SQUIGGLE_PRESETS, minSheetRatio: 360, maxSheetRatio: 1600, tone: SQUIGGLE_TONE, shape: 'circle',
     fieldRings: o => squiggleScale(o).rings,
     options: o => ({ speedMm: isStick(o.toolMm) ? 60 : 40, wiggleHz: isStick(o.toolMm) ? 3 : 5 }),
@@ -90,13 +91,15 @@ export const REAL_STYLES = [
   {
     id: 'stipple', letter: 'B', name: 'Stipple tour',
     blurb: 'A maze-like tour through thousands of dots, packed where it is dark.',
+    lineage: 'TSP art: one travelling-salesman tour through stipple dots (Kaplan & Bosch, 2005).',
     build: buildStipple, presets: null, minSheetRatio: 350, maxSheetRatio: 1400, tone: {}, shape: 'square',
     fieldRings: o => Math.max(12, Math.round(1 / (1.2 * tCU(o.toolMm, o.sheetMm)))),
     options: () => ({}),
   },
   {
-    id: 'scribble', letter: 'C', name: 'Scribble',
+    id: 'scribble', letter: 'C', name: 'Circle scribble',
     blurb: 'Circling loops that pile up in the shadows, like ballpoint shading.',
+    lineage: 'Circular scribble art: tone from overlapping loops.',
     build: buildScribble, presets: null, minSheetRatio: 330, maxSheetRatio: 1320, tone: {}, shape: 'square',
     fieldRings: () => 110,
     options: o => ({ markRatio: MARK_RATIO[o.tool] || 1 }),
@@ -104,6 +107,7 @@ export const REAL_STYLES = [
   {
     id: 'engrave', letter: 'D', name: 'Flow engraving',
     blurb: 'Long parallel strokes that bend over the form, like an old banknote.',
+    lineage: 'Banknote-style engraving lines, joined into one.',
     build: buildEngrave, presets: ENGRAVE_PRESETS, minSheetRatio: 360, maxSheetRatio: 2400, tone: {}, shape: 'square',
     fieldRings: o => {
       const bands = Math.round(1.97 / (engraveLevels(o) * tCU(o.toolMm, o.sheetMm)));

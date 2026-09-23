@@ -18,6 +18,12 @@
 //              a straight full-sheet shot that keeps creeping in, while the pen lies on the desk
 //              and the reveal retraces the drawing. Pace and camera are planned for the whole film
 //              up front as functions of time, so the dialog's live preview and the encode match.
+// Realistic and Line art films (doc.mode 'realistic' | 'lineart') are the true drawing: the pen
+// follows the planned order on the hand's own clock (geom.handT), opens in the macro at 1x and
+// speeds up to what the film's length needs. A Line art drawing (1-4 min by hand) films at near
+// real speed (15/30/60 s, about 2-8x at 30 s; never slowed below 1x: a short one holds longer at
+// the end), its looks at the model play at half the line's speed-up with the pen hovering, and the
+// counter and end card say the hand time to the second ("2 min 02 s of drawing in 30 s").
 // Everything is a pure function of the frame's time: frames can be drawn in any order.
 
 import { Renderer } from './renderer.js';
@@ -160,7 +166,8 @@ const REAL_A4 = 210;
  */
 const realCache = new WeakMap();
 export function realInfo(geom) {
-  const R = geom?.real || (geom?.path?.startsWith?.('real-') ? geom.stats : null);
+  // (a Line art drawing, js/lineart/index.js, keeps its facts in geom.lineart and films the same way)
+  const R = geom?.real || (geom?.path?.startsWith?.('real-') ? geom.stats : null) || (geom?.path === 'lineart' ? geom.lineart : null);
   if (!R || !(geom.n > 1)) return null;
   // (the dialog asks on every refresh: a derived clock is made once per geometry)
   const hit = realCache.get(geom);
@@ -190,7 +197,59 @@ function realFacts(geom, R) {
   if (!(total > 0)) total = T[n - 1];
   if (!(total > 0)) return null;
   const style = String(R.style || geom.path || '').replace(/^real-/, '');
-  return { style, sheetMm, toolMm, handSeconds: total, lengthM: +R.lengthM || 0, handT: T, preset: R.preset || null };
+  const info = { style, sheetMm, toolMm, handSeconds: total, lengthM: +R.lengthM || 0, handT: T, preset: R.preset || null,
+    lineart: geom.path === 'lineart' };
+  // the film's own clock: the hand's, except that a Line art artist's looks at the model play
+  // slower than the drawing (lineClock), so the pause reads at 4-8x instead of flashing by
+  info.clock = info.lineart ? lineClock(geom, T, sheetMm) : { F: T, P: null, total: T[n - 1] };
+  if (info.lineart) {
+    const L = geom.lineart;
+    Object.assign(info, { retracedM: +L.retracedM || 0, bridgesM: +L.bridgesM || 0, engine: L.engine || null,
+      pauses: info.clock.count, pauseSeconds: info.clock.paused });
+  }
+  return info;
+}
+
+// Line art (doc.mode 'lineart'): the looks at the model play at 1/PAUSE_SLOW of the drawing's
+// speed-up. The pen stays on the paper while the artist looks (the one-line promise, and the ink
+// pools there in the drawing): it only settles and the wrist turns a little.
+const PAUSE_SLOW = 2;
+const PAUSE_MIN = 0.12;        // hand seconds: shorter stops are the hand turning, not a look
+const LOOK_LIFT = 0.02;        // tool settle at the top of a long look (tools.js: 0 touching .. 1 high)
+const LOOK_WRIST = 4;          // degrees the wrist turns during a long look
+/**
+ * The pauses in a Line art geometry and the film clock that shows them. js/lineart/path.js adds
+ * each look to the segment that arrives at a feature's entry (handT[i] - handT[i - 1] = travel +
+ * pause), so the film moves the pen over that segment at the hand's speed first and then holds it
+ * at the entry. geom.lineart.pause (seconds per point) is used when the planner provides it;
+ * otherwise a pause is the time a segment takes beyond what its neighbours' speed explains.
+ * Returns { F (film clock per point: the hand's, with the pauses stretched), P (pause seconds per
+ * segment ending at i, or 0), total, count, paused }.
+ */
+function lineClock(geom, T, sheetMm) {
+  const n = geom.n, d = geom.data;
+  const given = geom.lineart?.pause;
+  const P = new Float32Array(n);
+  const mmPerCu = sheetMm * (geom.layout?.r || 0.42);
+  const ds = i => Math.hypot(d[i * STRIDE] - d[(i - 1) * STRIDE], d[i * STRIDE + 1] - d[(i - 1) * STRIDE + 1]) * mmPerCu;
+  const dt = i => T[i] - T[i - 1];
+  let count = 0, paused = 0;
+  for (let i = 1; i < n; i++) {
+    let p;
+    if (given && given.length === n) p = +given[i] || 0;
+    else {
+      const t = dt(i);
+      if (t < PAUSE_MIN) continue;
+      // the hand's speed just before and just after (mm/s), never under the planner's 1.5 mm/s floor
+      let v = 1.5;
+      for (const j of [i - 1, i + 1, i - 2, i + 2]) if (j >= 1 && j < n && dt(j) > 1e-6) v = Math.max(v, ds(j) / dt(j));
+      p = t - ds(i) / v;
+    }
+    if (p >= PAUSE_MIN) { P[i] = Math.min(p, dt(i)); count++; paused += P[i]; }
+  }
+  const F = new Float64Array(n);
+  for (let i = 1; i < n; i++) F[i] = F[i - 1] + dt(i) + (PAUSE_SLOW - 1) * P[i];
+  return { F, P, total: F[n - 1], count, paused };
 }
 
 /**
@@ -199,8 +258,28 @@ function realFacts(geom, R) {
  * readable. The stage transport can use it to preview the same film.
  */
 export function filmLengthFor(f, geom, realistic = false) {
+  // Line art (a geometry of path 'lineart', whatever the caller says): a drawing of 1-4 minutes
+  // films at near real speed, so 30 s unless a length was picked by hand, and never 10 s (15/30/60)
+  if (geom?.path === 'lineart' && realInfo(geom)) return lineartLength(f);
   const R = realistic ? realInfo(geom) : null;
   return R && !f.lengthChosen && R.handSeconds >= 1800 ? 60 : f.length;
+}
+/**
+ * Seconds of drawing in the film prefs.film `f` makes of `geom` (what the stage transport should
+ * preview): drawSeconds for the film's length, except that a Line art drawing shorter than that
+ * at real speed is drawn at 1x (FilmComposer._shortenDrawing) and the sheet holds longer.
+ */
+export function filmDrawSeconds(f, geom, realistic = false) {
+  const R = realistic || geom?.path === 'lineart' ? realInfo(geom) : null;
+  const D = R ? drawSeconds(filmLengthFor(f, geom, realistic), false, f.style, signSeconds(f.signature))
+    : drawSeconds(f.length, f.reveal, f.style, signSeconds(f.signature));
+  return R?.lineart && R.clock.total + 0.2 < D ? R.clock.total + 0.2 : D;
+}
+export const LINEART_LENGTHS = [15, 30, 60];
+function lineartLength(f) {
+  const L = +f.length;
+  if (!f.lengthChosen) return 30;
+  return LINEART_LENGTHS.includes(L) ? L : L < 15 ? 15 : L > 60 ? 60 : 30;
 }
 
 /**
@@ -209,7 +288,8 @@ export function filmLengthFor(f, geom, realistic = false) {
  * '24 min' there and '23 min' here; withSeconds is the live counter, a clock that counts up.
  */
 export function formatHand(sec, withSeconds = false) {
-  if (!withSeconds) return formatHandSaid(sec);
+  // (withSeconds 'total': a whole Line art drawing, said to the second: '2 min 02 s')
+  if (!withSeconds || (withSeconds === 'total' && sec >= 3600)) return formatHandSaid(sec);
   const s = Math.max(0, Math.round(sec));
   if (s < 60) return `${s} s`;
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
@@ -375,7 +455,10 @@ export class FilmComposer {
     // o.realistic (doc.mode === 'realistic'): true drawing, sped up. Only a geometry that carries
     // its real facts (realInfo) can be filmed that way; anything else films as it always has.
     // (the app's renderState says so itself: state.mode, state.light)
-    this.real = (o.realistic ?? o.state?.mode === 'realistic') ? realInfo(o.state?.geom) : null;
+    // Line art (state.mode 'lineart') is a true drawing too: the artist's own order and clock
+    const lineMode = o.state?.mode === 'lineart' || (o.lineart ?? false);
+    this.real = (o.realistic ?? (o.state?.mode === 'realistic' || lineMode)) || lineMode ? realInfo(o.state?.geom) : null;
+    this.lineart = !!this.real?.lineart;
     if (this.real) {
       // no photo reveal, no fades: only what a camera over a real desk would record
       this.reveal = false;
@@ -414,9 +497,54 @@ export class FilmComposer {
       const mm = TOOL_MM[this.state?.brush?.tool] || 140;
       this.toolLen = TOOL_LEN[style] * (mm / 140) * this.realScale;
       // the pen follows the hand's own clock (both styles)
-      this.hand = planHandPace({ t0: this.t0, t1: this.t1, total: this.real.handSeconds });
+      const C = this.real.clock;
+      const total = this.lineart ? C.total : this.real.handSeconds;
+      // Line art at near real speed: a drawing shorter than the film's drawing time is drawn at 1x
+      // (never slowed down); the sheet then holds longer on the desk
+      if (this.lineart && total + 0.2 < this.D) this._shortenDrawing(total + 0.2);
+      this.hand = planHandPace({ t0: this.t0, t1: this.t1, total });
       this.pace = this.hand;
     }
+  }
+
+  /** The drawing takes D seconds of the film instead (the pen's work ends sooner; the hold grows). */
+  _shortenDrawing(D) {
+    const T = this.tl, cut = this.D - D;
+    this.D = D;
+    this.t1 -= cut; this.tS0 -= cut; this.tS1 -= cut; this.tDone -= cut;
+    this.hold += cut;
+    this.tReveal = this.tDone + T.lift + this.hold;
+    this.restAt = this.tDone + T.lift + 0.5;
+  }
+
+  /**
+   * Line art: where the pen is on the film clock `h` (film-clock seconds, lineClock's F): the
+   * fractional point index, the hand's own seconds at that moment, and how far a look at the model
+   * has got (0 drawing .. 1 at the top of a long look: the settle and the turn of the wrist).
+   */
+  _lineAt(h) {
+    const C = this.real.clock, F = C.F, P = C.P, T = this.real.handT, n = F.length;
+    if (h <= 0) return { fi: 0, hand: 0, look: 0 };
+    if (h >= F[n - 1]) return { fi: n - 1, hand: T[n - 1], look: 0 };
+    let lo = 0, hi = n - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (F[m] <= h) lo = m; else hi = m; }
+    const local = h - F[lo], p = P ? P[hi] : 0;
+    const move = Math.max(0, T[hi] - T[lo] - p);
+    if (local < move || !p) {
+      const k = move > 0 ? Math.min(1, local / move) : 1;
+      return { fi: lo + k, hand: T[lo] + k * move, look: 0 };
+    }
+    // the look: the pen rests at the feature's entry, settles and the wrist turns a little, then
+    // draws on; a long look turns it further than a glance
+    const u = clamp((local - move) / (p * PAUSE_SLOW), 0, 1);
+    const up = smooth(0, 0.3, u) * (1 - smooth(0.72, 1, u));
+    return { fi: hi, hand: T[lo] + move + u * p, look: up * clamp(p / 0.7, 0.35, 1) };
+  }
+
+  /** Line art: the hover of a look at time t (0 elsewhere). */
+  _look(t) {
+    if (!this.lineart || !this.hand || t <= this.t0 || t >= this.t1) return 0;
+    return this._lineAt(this.hand.hand(t)).look;
   }
 
   prepare() {
@@ -519,6 +647,7 @@ export class FilmComposer {
   _idx(p) {
     const { geom } = this.state;
     if (!this.real) return indexAt(geom, p, this.pacing);
+    if (this.lineart) return this._lineAt(clamp(p, 0, 1) * this.real.clock.total).fi;
     const T = this.real.handT, n = geom.n, h = clamp(p, 0, 1) * T[n - 1];
     if (h <= T[0]) return 0;
     if (h >= T[n - 1]) return n - 1;
@@ -549,6 +678,7 @@ export class FilmComposer {
     const { geom } = this.state;
     // spirals grow from the centre (or close in from the rim); every other path (maze, wander,
     // contour) starts where the user pointed and roams, so the camera follows it
+    // (a Line art drawing goes feature by feature: the camera follows the pen)
     const spiral = !geom.path || geom.path === 'spiral' || (!!this.real && geom.path === 'real-squiggle');
     return !spiral ? 'follow' : geom.start === 'edge' ? 'edge' : 'center';
   }
@@ -605,7 +735,10 @@ export class FilmComposer {
       tone[k] = clamp(0.8 - 0.25 * (q - 1), 0.5, 0.95);
       w[k] = pen.mm / SHEET_MM / L.r * fIn * fOut * (brushy ? clamp(1.2 - 0.3 * (q - 1), 0.75, 1.35) : 1);
       // the realistic film signs with the very tool that drew: one fixed width, no swell
-      if (this.real) { w[k] = this.real.toolMm / this.real.sheetMm / L.r; tone[k] = 0.8; }
+      // (Line art: the same nib, brush or pencil, swelling and tapering as the drawing's own line did)
+      // (never broader than that kind of tool signs: a 1.5 mm brush writes a name with its tip)
+      if (this.lineart) w[k] *= Math.min(this.real.toolMm, pen.mm) / this.real.sheetMm * SHEET_MM / pen.mm;
+      else if (this.real) { w[k] = this.real.toolMm / this.real.sheetMm / L.r; tone[k] = 0.8; }
       // the nib rests a moment where a stroke starts (wet media leave a small blot there)
       dwell[k] = 1 + 0.6 * Math.exp(-a / 0.25) + 0.25 * Math.exp(-b / 0.2);
     }
@@ -741,9 +874,12 @@ export class FilmComposer {
       const z = mm => Math.max(1.1, spanMm / mm);
       const open = this.hand.open;
       if (macro) macro = { zoom: clamp(z(field), 3.5, 14), hold: Math.max(0.6, open - 0.5), ease: clamp(0.3 * this.D, 1.2, 2.6) };
+      // Line art plays at 2-8x, not hundreds: the camera can stay closer and drift with the hand
+      // from feature to feature (a look at an eye, then the nose) instead of framing the region
+      const mid = this.lineart ? 3.3 : 4;
       shot = {
         center: { close: z(field * 2.2), pull: Math.min(z(field * 2.2), z(field * 4.5)), pullAt: open + 0.3 },
-        follow: { close: z(field * 2.6), mid: Math.min(z(field * 2.6), z(field * 4)), hold: open, ease: clamp(0.25 * this.D, 1.5, 3) },
+        follow: { close: z(field * 2.6), mid: Math.min(z(field * 2.6), z(field * mid)), hold: open, ease: clamp(0.25 * this.D, 1.5, 3) },
       };
     }
     this.intent = lib.shotIntent({ mode, t0: this.t0, t1: this.t1, art: this.art, frame: this.frame, safe: this.safe, path: { x, y }, macro, shot });
@@ -796,7 +932,7 @@ export class FilmComposer {
     const body = [Math.sin(a), Math.cos(a)];            // from the tip toward the back end
     const across = [-Math.cos(a), Math.sin(a)];
     const LEN = this.toolLen, T = this.tl;
-    let x, y, lift, alpha = 1;
+    let x, y, lift, alpha = 1, look = 0;
     const at = fi => { const h = headAt(geom, fi); return this._world(h.x, h.y); };
     // pressure: dark passages press down, pale ones barely touch (the shadow closes in / opens)
     const bob = 0.12 * Math.pow(1 - clamp(this._track('tone', t), 0, 1), 1.5);
@@ -811,7 +947,8 @@ export class FilmComposer {
       alpha = smooth(0, 0.35, k);
     } else if (t < this.t1) {
       [x, y] = at(this._fi(t));
-      lift = bob;
+      look = this._look(t);
+      lift = Math.max(bob, LOOK_LIFT * look);
     } else if (this.sign && t < this.tDone) {
       // hops over to the corner and signs
       [x, y] = this._tipAt(t);
@@ -828,7 +965,7 @@ export class FilmComposer {
     // the body leans into the direction of travel (the hand leads, the tip follows)
     const v = this._track('vx', t) * across[0] + this._track('vy', t) * across[1];
     const lean = -7 * Math.tanh(v / 2.2);
-    return { x, y, lift, alpha, angle: TOOL_ANGLE + lean, sway: (t * 0.31) % 1, elev: HOLD_ELEV };
+    return { x, y, lift, alpha, angle: TOOL_ANGLE + lean + LOOK_WRIST * look, sway: (t * 0.31) % 1, elev: HOLD_ELEV };
   }
 
   /**
@@ -871,8 +1008,9 @@ export class FilmComposer {
     } else if (t <= this.t1) {
       const fi = this._fi(t);
       [x, y] = at(fi);
-      lift = bob;
-      angle += this._arm(fi);
+      const look = this._look(t);
+      lift = Math.max(bob, LOOK_LIFT * look);
+      angle += this._arm(fi) + LOOK_WRIST * look;
     } else if (this.sign && t <= this.tDone) {
       [x, y] = this._tipAt(t);
       lift = this._signLift(t, bob);
@@ -1266,6 +1404,14 @@ export class FilmComposer {
     // a realistic big sheet's small tool is put down where a hand would: just off the sheet's lower
     // edge, under the right half of the drawing (not far out on the desk, where it would be lost)
     if (this.realScale < 0.75 && this.format !== 'wide') { tip = [this.px + side * 0.62, yb + Math.max(L * 0.35, side * 0.035)]; ang = 99; }
+    // the end card ("2 min 02 s of drawing in 30 s") has the lower right corner: a tool laid down
+    // across it slides left until its back end clears the card
+    const card = this.counter ? this._cardBox() : null;
+    if (card) {
+      const bx = tip[0] + Math.sin(ang * DEG) * L, pad = 0.03 * L;
+      const top = Math.min(tip[1], tip[1] + Math.cos(ang * DEG) * L) - pad, bottom = Math.max(tip[1], tip[1] + Math.cos(ang * DEG) * L) + pad;
+      if (bottom > card.y0 && top < card.y1 && bx > card.x0 - pad) tip[0] = Math.max(side * 0.03, tip[0] - (bx - card.x0 + 2.5 * pad));
+    }
     const back = [tip[0] + Math.sin(ang * DEG) * L, tip[1] + Math.cos(ang * DEG) * L];
     const fits = back[0] < W - side * 0.02 && back[1] > 0 && tip[1] < H - side * 0.03;
     if (fits) {
@@ -1513,6 +1659,28 @@ export class FilmComposer {
    * cells so nothing jitters as they count. When the pen lifts it gives way to the end card line,
    * "3 h 12 min of drawing in 30 s", in the same corner.
    */
+  /** The end card's line: '3 h 12 min of drawing in 30 s' (Line art to the second: '2 min 02 s …'). */
+  _cardText() {
+    const total = (this.lineart ? this.real.handT[this.real.handT.length - 1] : this.hand.total) + (this.sign ? this.signW : 0);
+    return `${formatHand(total, this.lineart ? 'total' : false)} of drawing in ${Math.round(this.length)} s`;
+  }
+
+  /** Where the end card's plate lies in the frame (px), as _drawCounter draws it. */
+  _cardBox() {
+    if (!this.hand) return null;
+    const { W, H } = this, k = Math.min(W, H), m = Math.round(0.045 * k);
+    const x1 = W - m, y1 = this.format === 'story' ? Math.round(H * 0.855) : H - m;
+    const px = Math.round(0.034 * k);
+    let tw = this._cardText().length * px * 0.42;
+    try {
+      const g = makeLayer(4, 4).g;
+      g.font = `italic 400 ${px}px "Instrument Serif", Georgia, serif`;
+      tw = g.measureText(this._cardText()).width;
+    } catch { /* the estimate */ }
+    const padX = px * 0.6, padY = px * 0.34;
+    return { x0: x1 - tw - padX, x1: x1 + padX, y0: y1 - px * 0.78 - padY, y1: y1 + px * 0.24 + padY };
+  }
+
   _drawCounter(g, t) {
     const { W, H } = this, H0 = this.hand;
     if (!H0) return;
@@ -1520,10 +1688,11 @@ export class FilmComposer {
     // (a story: below where the pen is laid down, above the apps' reply bar)
     const x1 = W - m, y1 = this.format === 'story' ? Math.round(H * 0.855) : H - m;
     const signing = this.sign && t > this.t1 ? clamp(t - this.tS0, 0, this.signW) : 0;
-    const hand = H0.hand(t) + signing;
+    // (Line art: the film clock stretches the looks; the counter reads the hand's own seconds)
+    const handNow = this.lineart ? (t >= this.t1 ? this.real.handT[this.real.handT.length - 1] : this._lineAt(H0.hand(t)).hand) : H0.hand(t);
+    const hand = handNow + signing;
     const drawing = t >= this.t0 && t < this.tDone;
     const speed = t < this.t1 ? H0.speed(t) : 1;
-    const total = H0.total + (this.sign ? this.signW : 0);
     const endAt = this.tDone + 0.35;
     const e = smooth(endAt, endAt + 0.5, t);
     g.save();
@@ -1580,7 +1749,7 @@ export class FilmComposer {
     if (e > 0) {
       const px = Math.round(0.034 * k);
       g.font = `italic 400 ${px}px "Instrument Serif", Georgia, serif`;
-      const text = `${formatHand(total)} of drawing in ${Math.round(this.length)} s`;
+      const text = this._cardText();
       const tw = g.measureText(text).width, padX = px * 0.6, padY = px * 0.34;
       plate(x1 - tw - padX, x1 + padX, y1 - px * 0.78 - padY, y1 + px * 0.24 + padY, e);
       g.globalAlpha = e;
@@ -1927,8 +2096,11 @@ export function createFilmDialog(app) {
   function currentFormat() { return FORMATS[f.format] || FORMATS.square; }
   // Realistic mode (doc.mode, with a geometry that carries its hand time): the film is the true
   // drawing, sped up
-  const realNow = () => (app.doc?.mode === 'realistic' ? realInfo(app.geom) : null);
+  // Line art mode films the same way, at near real speed (15, 30 or 60 s)
+  const lineNow = () => app.doc?.mode === 'lineart' && app.geom?.path === 'lineart';
+  const realNow = () => (app.doc?.mode === 'realistic' || lineNow() ? realInfo(app.geom) : null);
   const filmLength = () => filmLengthFor(f, app.geom, app.doc?.mode === 'realistic');
+  const modeLight = () => (lineNow() ? app.doc?.lineart?.light : app.doc?.real?.light);
   // the sheet's width in the full-size film's final frame (the fine-line guard is judged on it)
   function filmSide() { const fmt = currentFormat(); return sheetPlace(f.format, fmt.w, fmt.h, f.style).side; }
   const fps = () => (FPS_CHOICES.includes(+f.fps) ? +f.fps : FPS);
@@ -1971,7 +2143,7 @@ export function createFilmDialog(app) {
       renderer: filmStage().renderer, desk: f.desk, live,
       W, H, format: f.format, length: filmLength(), showTool: f.showTool, polaroid: f.polaroid, reveal: f.reveal && !realNow(),
       pacing: app.prefs.pacing, state: snapshotState(filmSide()),
-      realistic: !!realNow(), counter: f.counter !== false, light: app.doc?.real?.light,
+      realistic: !!realNow(), lineart: lineNow(), counter: f.counter !== false, light: modeLight(),
       drawPhoto: app.photo ? (g, cx, cy, R) => app.drawPhotoInCircle(g, cx, cy, R) : null,
       tools: modules?.tools, sceneLib: modules?.scene, style: f.style,
       // the pace and the camera are planned in seconds, so the preview runs the film's own frame
@@ -2002,7 +2174,10 @@ export function createFilmDialog(app) {
       if (R) {
         const D = drawSeconds(len, false, f.style, signSeconds(f.signature));
         const avg = R.handSeconds / Math.max(1, D);
-        hand.textContent = `About ${formatHand(R.handSeconds)} of drawing by hand · shown ${avg >= 1.25 ? `about ${formatSpeed(avg)} faster` : 'at real speed'} in ${len} s`;
+        hand.textContent = R.lineart
+          // (the looks at the model play a little slower than the line: the speed-up is the line's)
+          ? `${formatHand(R.handSeconds, 'total')} of drawing by hand · shown ${avg >= 1.25 ? `about ${formatSpeed(R.clock.total / Math.max(1, D))} faster` : 'at real speed'} in ${len} s`
+          : `About ${formatHand(R.handSeconds)} of drawing by hand · shown ${avg >= 1.25 ? `about ${formatSpeed(avg)} faster` : 'at real speed'} in ${len} s`;
       }
     }
     const note = $('filmEngineNote');
@@ -2077,6 +2252,9 @@ export function createFilmDialog(app) {
     // and the drawing clock to show or not
     const R = !!realNow();
     for (const [id, hide] of [['filmRevealRow', R], ['filmMore', R], ['filmCounterRow', !R]]) { const el = $(id); if (el) el.hidden = hide; }
+    // Line art is filmed at near real speed: 15, 30 or 60 s (no 10 s clip of a 2 minute drawing)
+    const line = lineNow();
+    for (const b of dlg.querySelectorAll('[data-film="length"] [data-v]')) b.hidden = b.disabled = line && !LINEART_LENGTHS.includes(+b.dataset.v);
     summary();
     filmGeometry(filmSide());
     if (!$('filmSetup').hidden) startPreview();
@@ -2210,7 +2388,10 @@ export function createFilmDialog(app) {
         sign: composer.sign ? { t0: composer.tS0, t1: composer.tS1, em: +composer.sign.em.toFixed(4), font: composer.sign.font, text: composer.sign.text } : null,
         real: composer.real ? { style: composer.real.style, sheetMm: composer.real.sheetMm, toolMm: composer.real.toolMm,
           handSeconds: Math.round(composer.real.handSeconds), peak: Math.round(composer.hand.peak), avg: Math.round(composer.hand.avg),
-          open: composer.hand.open, toolLen: +composer.toolLen.toFixed(4), mode: composer.intent?.mode || null, length: composer.length } : null,
+          open: composer.hand.open, toolLen: +composer.toolLen.toFixed(4), mode: composer.intent?.mode || null, length: composer.length,
+          lineart: composer.lineart ? { handT: +composer.real.handT[composer.real.handT.length - 1].toFixed(1), pauses: composer.real.pauses,
+            pauseSeconds: +composer.real.pauseSeconds.toFixed(1), drawEnd: +composer.t1.toFixed(3), macro: !!composer.intent?.macro,
+            retracedM: composer.real.retracedM, engine: composer.real.engine } : null } : null,
       };
       result = res;
       showResult(res, W, H);
@@ -2246,7 +2427,8 @@ export function createFilmDialog(app) {
 
   function fileBase() {
     const name = (app.photo?.name || 'drawing').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 24) || 'drawing';
-    return `spiralist-${name}-${app.lookName().toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${filmLength()}s`;
+    const look = lineNow() ? `line-art-${app.doc.lineart?.style || app.geom?.lineart?.style || 'drawing'}` : app.lookName();
+    return `spiralist-${name}-${String(look).toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${filmLength()}s`;
   }
 
   function showResult(res, W, H) {

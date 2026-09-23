@@ -11,7 +11,7 @@ import { rasterize, processTone, buildField, TONE_DEFAULTS, CROP_DEFAULTS, cropD
 import { buildSpiral, LINE_DEFAULTS, indexAt, headAt, printedLength, previewStroke, STRIDE } from './spiral.js';
 import { buildMaze } from './maze.js';
 import { buildWander, buildContour, FREE_DEFAULTS } from './freeline.js';
-import { BRUSHES, PAPERS, LOOKS, brushById, paperById, lookById, inkMode, hexToRgb, luminance, contrastRatio, SHEET_MM, REAL_TOOLS, realToolFor } from './materials.js';
+import { BRUSHES, PAPERS, LOOKS, brushById, paperById, lookById, inkMode, hexToRgb, luminance, contrastRatio, SHEET_MM, REAL_TOOLS, realToolFor, LINE_TOOLS, lineToolFor } from './materials.js';
 import { lightById } from './papers.js';
 import { REAL_STYLES, SHEETS, realStyleById, autoSheet, sheetFit, fitManualSheet, realFieldRings, formatHand, formatMm, formatSheet, LAYOUT_R } from './real/index.js';
 import { RealBuilder } from './real/builder.js';
@@ -20,7 +20,7 @@ import { loadSettings, saveSettings, clearSettings, savePhoto, loadPhoto, forget
 import { History } from './history.js';
 import { sliderRow, bindSeg, rovingGrid, setChecked, popover, toast, announce, fmtTime, reducedMotion, isTouch, paintRange } from './ui.js';
 import { Thumbs } from './thumbs.js';
-import { drawSeconds, drawProgress, signSeconds, warmFilm, filmLengthFor } from './film.js';
+import { drawSeconds, drawProgress, signSeconds, warmFilm, filmLengthFor, filmDrawSeconds } from './film.js';
 import { starCount } from './share.js';
 import { Loupe } from './loupe.js';
 
@@ -41,9 +41,17 @@ const DEFAULT_DOC = {
   // paperChosen: the user picked a paper in Realistic mode, so a tool change keeps it (otherwise
   // each tool starts on its own real sheet: chalk on a board, charcoal on cold-press)
   real: { style: 'squiggle', preset: 'detailed', tool: 'fineliner', toolMm: 0.4, sheetMm: 210, sheetAuto: true, sheetPick: null, light: 'window', paperChosen: false },
+  // Line art mode: one-line drawings the way continuous-line artists make them (js/lineart/):
+  // a style A-D, how much of the photo it keeps (detail), hatching, the hand's wobble, a real tool
+  // at its real width on an A4 sheet, the paper and the light. doc.brush / doc.paper follow it.
+  lineart: { style: 'matisse', detail: 0.45, tool: 'fountain', toolMm: 0.55, paper: 'cream', light: 'window', hatch: 0, wobble: 0.3 },
   // the other mode's materials (tool, ink, paper, tone detail), restored when switching back
   stash: {},
 };
+const MODES = ['artistic', 'realistic', 'lineart'];
+const LINE_STYLE_IDS = ['picasso', 'matisse', 'blind', 'brush'];
+// Line art draws on a real A4 sheet (the square drawing on it), like the line-up it was tuned on
+const LINE_SHEET_MM = 210;
 const DEFAULT_PREFS = {
   theme: 'system', pacing: 'natural', speed: 1, showTool: true,
   film: { format: isTouch() ? 'story' : 'square', length: 15, showTool: true, polaroid: true, reveal: false, desk: 'nero', signature: '' },
@@ -69,7 +77,7 @@ function mergeDoc(d) {
   if (!BRUSHES.some(b => b.id === out.brush)) out.brush = base.brush;
   if (!PAPERS.some(p => p.id === out.paper)) out.paper = base.paper;
   if (!/^#[0-9a-f]{6}$/i.test(out.ink)) out.ink = base.ink;
-  out.mode = out.mode === 'realistic' ? 'realistic' : 'artistic';
+  out.mode = MODES.includes(out.mode) ? out.mode : 'artistic';
   const r = out.real = { ...base.real, ...d.real };
   if (!REAL_STYLES.some(s => s.id === r.style)) r.style = base.real.style;
   if (!['quick', 'detailed', 'masterpiece'].includes(r.preset)) r.preset = 'detailed';
@@ -81,6 +89,14 @@ function mergeDoc(d) {
   if (!SHEETS.some(s => s.mm === r.sheetPick)) r.sheetPick = null;
   out.stash = d.stash && typeof d.stash === 'object' ? d.stash : {};
   if (out.mode === 'realistic') { out.brush = r.tool; syncAutoSheet(out); }
+  const la = out.lineart = { ...base.lineart, ...d.lineart };
+  if (!LINE_STYLE_IDS.includes(la.style)) la.style = base.lineart.style;
+  if (!LINE_TOOLS.some(t => t.brush === la.tool)) la.tool = base.lineart.tool;
+  if (!(la.toolMm > 0.1 && la.toolMm < 6)) la.toolMm = lineToolFor(la.tool).sizes[0];
+  if (!PAPERS.some(p => p.id === la.paper)) la.paper = base.lineart.paper;
+  if (!['window', 'raking', 'overhead'].includes(la.light)) la.light = 'window';
+  for (const k of ['detail', 'hatch', 'wobble']) la[k] = Number.isFinite(+la[k]) ? clamp(+la[k], 0, 1) : base.lineart[k];
+  if (out.mode === 'lineart') { out.brush = la.tool; out.paper = la.paper; if (out.inkSource === 'photo') out.inkSource = 'swatch'; }
   return out;
 }
 /**
@@ -121,18 +137,23 @@ function applyLookTo(d, look) {
 
 const brush = () => brushById(doc.brush);
 const realistic = () => doc.mode === 'realistic';
-/** The sheet's real width: the virtual sheet in Artistic mode, the chosen real sheet in Realistic. */
-const sheetMm = () => (realistic() ? doc.real.sheetMm : null);
+const lineart = () => doc.mode === 'lineart';
+/** The sheet's real width: the virtual sheet in Artistic mode, the chosen real sheet in Realistic, A4 in Line art. */
+const sheetMm = () => (realistic() ? doc.real.sheetMm : lineart() ? LINE_SHEET_MM : null);
 /** The outline of the drawing: the spiral and circle mazes are round, square mazes square. */
-const artShape = () => (realistic() ? realStyleById(doc.real.style).shape
+const artShape = () => (realistic() ? realStyleById(doc.real.style).shape : lineart() ? 'square'
   : doc.line.path !== 'spiral' && doc.free.shape === 'square' ? 'square' : 'circle');
+/** The light the sheet is lit by: named in Realistic and Line art, the default window otherwise. */
+const lightId = () => (realistic() ? doc.real.light : lineart() ? doc.lineart.light : '');
+/** A drawing that carries a hand clock (Realistic or Line art): { handSeconds, lengthM, toolMm, ... }. */
+const handInfo = (g = geom) => (realistic() && g?.real) || (lineart() && g?.lineart) || null;
 function clipArt(ctx, cx, cy, R, shape = artShape()) {
   ctx.beginPath();
   if (shape === 'square') ctx.rect(cx - R, cy - R, 2 * R, 2 * R);
   else ctx.arc(cx, cy, R, 0, Math.PI * 2);
 }
 const paper = () => paperById(doc.paper);
-const photoColor = () => doc.inkSource === 'photo' && !realistic();
+const photoColor = () => doc.inkSource === 'photo' && doc.mode === 'artistic';
 const mode = () => inkMode(brush(), doc.ink, paper(), photoColor());
 const flip = () => mode().flip !== !!doc.tone.invert;
 
@@ -146,6 +167,7 @@ function keyOf(...parts) { return parts.map(p => (typeof p === 'object' ? JSON.s
 function computeGeometry(draft = false) {
   if (!photo) return null;
   if (realistic()) return computeRealGeometry(draft);
+  if (lineart()) return computeLineGeometry();
   const G = draft ? 512 : 1024;
   const rk = keyOf(photo.id, doc.crop, G);
   if (cache.rk !== rk) { cache.raster = rasterize(photo.canvas, doc.crop, G); cache.rk = rk; }
@@ -224,13 +246,13 @@ function realBuildFailed(key) {
     updateStat();
   }
 }
-function setBuilding(on) {
+function setBuilding(on, label = 'Drawing the line…') {
   const el = $('sheet');
   clearTimeout(setBuilding.t);
   if (!on) { el.classList.remove('building'); updateStat(); return; }
   // only a build that takes a moment shows a label (most land within a frame or two)
   setBuilding.t = setTimeout(() => {
-    el.dataset.building = 'Drawing the line…';
+    el.dataset.building = label;
     el.classList.add('building');
     updateStat();
   }, 160);
@@ -250,9 +272,9 @@ export function renderState(g = geom) {
   return {
     geom: g, brush: brush(), paper: paper(), ink: doc.ink, cover: m.cover, photoColor: photoColor(),
     layout: { ...LAYOUT }, seed: doc.line.seed || 1, shape: artShape(),
-    // Realistic mode: the real sheet (paper texture keeps its millimetre size) and the chosen light
-    mode: doc.mode, real: realistic() ? { ...doc.real } : null,
-    sheetMm: sheetMm(), light: realistic() ? lightById(doc.real.light) : null,
+    // Realistic and Line art: the real sheet (paper texture keeps its millimetre size) and the chosen light
+    mode: doc.mode, real: realistic() ? { ...doc.real } : null, lineart: lineart() ? { ...doc.lineart } : null,
+    sheetMm: sheetMm(), light: lightId() ? lightById(lightId()) : null,
   };
 }
 
@@ -287,7 +309,7 @@ const loupe = new Loupe($('sheet'), {
     bar: $('loupeBar'), zoom: $('loupeZ'), rule: $('loupeRule'), mm: $('loupeMm'),
     btnIn: $('loupeIn'), btnOut: $('loupeOut'), btnFit: $('loupeFit'), btnToggle: $('btnLoupe'),
   },
-  sheetMm: () => (realistic() ? doc.real.sheetMm : SHEET_MM),
+  sheetMm: () => sheetMm() ?? SHEET_MM,
   canZoom: () => !!photo && !framing.active && !picking.active,
   onChange: () => invalidate('render'),
   onGesture: () => clearTimeout(lpTimer),
@@ -307,8 +329,9 @@ const play = {
 };
 // the drawing's share of the film: the transport previews exactly the film's pace
 // (Realistic: the film that the dialog makes: its own length for long drawings, never a reveal)
-const drawSec = () => (realistic() && geom?.real
-  ? drawSeconds(filmLengthFor(prefs.film, geom, true), false, prefs.film.style, signSeconds(prefs.film.signature))
+// (Line art: a drawing shorter than the film at real speed is drawn at 1x: filmDrawSeconds)
+const drawSec = () => (handInfo()
+  ? filmDrawSeconds(prefs.film, geom, true)
   : drawSeconds(prefs.film.length, prefs.film.reveal, prefs.film.style, signSeconds(prefs.film.signature)));
 /** Hand time reached at transport position f (Realistic drawings carry the hand clock). */
 const handAtF = f => geom.handT[Math.min(geom.n - 1, Math.floor(pointIndexFinite(f)))];
@@ -366,7 +389,7 @@ function tick(now) {
     const draft = need.draft;
     need.geom = false; need.draft = false;
     const g = computeGeometry(draft);
-    if (g !== geom && (g || realistic())) { geom = g; if (g) renderer.setGeometry(geom); }
+    if (g !== geom && (g || !!photo)) { geom = g; if (g) renderer.setGeometry(geom); }
     lastGeomMs = performance.now() - t0;
     if (!draft) { need.penSees = true; scheduleIdleWork(); }
     updateStat();
@@ -413,7 +436,7 @@ function applyRendererState() {
   // Realistic: grain, fibres and grit keep their real millimetre size on a big sheet; named light
   const mm = sheetMm();
   if (typeof renderer.setSheetMm === 'function' && applyRendererState.mm !== mm) { renderer.setSheetMm(mm); applyRendererState.mm = mm; }
-  const light = realistic() ? doc.real.light : '';
+  const light = lightId();
   if (applyRendererState.light !== light) { renderer.setLight(light ? lightById(light) : undefined); applyRendererState.light = light; }
   $('sheet').style.background = paper().color;
 }
@@ -568,7 +591,7 @@ function drawOverlay(now) {
   // Realistic: the tool at its real length on the real sheet (a 9 cm charcoal stick is small over a
   // 1.5 m sheet); never longer than the Artistic sprite, which is already short for an A4 sheet
   const realLen = { charcoal: 90, chalk: 80, crayon: 90, marker: 140, brush: 220, watercolour: 220 }[doc.brush] || 150;
-  const size = S * (realistic() ? clamp(realLen / doc.real.sheetMm, 0.05, 0.28) : 0.28);
+  const size = S * (sheetMm() ? clamp(realLen / sheetMm(), 0.05, 0.28) : 0.28);
   const lift = play.lift;
   const opts = {
     color: photoColor() ? '#8a5a44' : doc.ink,
@@ -641,9 +664,9 @@ function updateTransport() {
   if (!play.scrubbing) scrub.value = Math.round(play.f * 1000);
   paintRange(scrub);
   const total = drawSec();
-  // Realistic: the honest clock is the hand's ('13 min / 58 min'), not the film's 12 s
-  const hand = realistic() && geom?.real && geom.handT;
-  $('time').textContent = hand ? `${formatHand(handAtF(play.f))} / ${formatHand(geom.real.handSeconds)}`
+  // Realistic and Line art: the honest clock is the hand's ('13 min / 58 min'), not the film's 12 s
+  const hi = handInfo(), hand = hi && geom.handT;
+  $('time').textContent = hand ? `${formatHand(handAtF(play.f))} / ${formatHand(hi.handSeconds)}`
     : `${fmtTime(play.f * total)} / ${fmtTime(total)}`;
   $('time').classList.toggle('hand', !!hand);
   const ring = geom ? Math.round(headRing()) : 0;
@@ -669,8 +692,8 @@ scrub.addEventListener('input', () => {
   const tip = $('scrubTip');
   const total = drawSec();
   tip.hidden = false;
-  tip.textContent = geom?.real && geom.handT
-    ? `${formatHand(handAtF(play.f))} of ${formatHand(geom.real.handSeconds)} by hand`
+  tip.textContent = handInfo() && geom.handT
+    ? `${formatHand(handAtF(play.f))} of ${formatHand(handInfo().handSeconds)} by hand`
     : geom && geom.path !== 'spiral'
     ? `${Math.round(play.f * 100)}% drawn · ${fmtTime(play.f * total)}`
     : `Ring ${Math.round(headRing())} of ${geom?.rings ?? 0} · ${fmtTime(play.f * total)}`;
@@ -854,7 +877,7 @@ function buildPapers() {
 function setPaper(id) {
   const p = paperById(id);
   if (p.id === doc.paper) return;
-  change(d => { d.paper = p.id; if (realistic()) d.real.paperChosen = true; }, { label: `Paper: ${p.name}`, level: 'geom', thumbs: true });
+  change(d => { d.paper = p.id; if (realistic()) d.real.paperChosen = true; if (lineart()) d.lineart.paper = p.id; }, { label: `Paper: ${p.name}`, level: 'geom', thumbs: true });
   announce(p.name);
 }
 
@@ -1002,6 +1025,7 @@ $('lineReset').addEventListener('click', () => {
 
 function updateStat() {
   updateRealInfo();
+  updateLineInfo();
   const el = $('lineStat');
   if (!geom) { el.textContent = ''; return; }
   const m = printedLength(geom, CIRCLE_MM);
@@ -1053,11 +1077,24 @@ function retone(d, from, to) {
 const toolSizeLabel = (t, mm) => (t.label && mm === t.sizes[0] ? t.label : `${mm} mm`);
 
 function setMode(v) {
-  if (v === doc.mode || !['artistic', 'realistic'].includes(v)) return;
+  if (v === doc.mode || !MODES.includes(v)) return;
+  // Line art's reads and builds go on in the background: their "building" label stays in Line art
+  if (doc.mode === 'lineart') setBuilding(false);
   change(d => {
     d.stash = { ...d.stash, [d.mode]: { brush: d.brush, ink: d.ink, inkSource: d.inkSource, paper: d.paper } };
+    // Realistic tunes the tone per style; the other modes start from the plain defaults
+    if (d.mode === 'realistic') retone(d, styleTone(d.real.style), TONE_DEFAULTS);
     const back = d.stash[v];
-    if (v === 'realistic') {
+    if (v === 'lineart') {
+      // a line artist's own tool and paper (the style's, the first time); one ink, no photo colour
+      const t = lineToolFor(d.lineart.tool);
+      d.mode = 'lineart';
+      d.brush = t.brush;
+      if (back) Object.assign(d, { ink: back.ink, inkSource: back.inkSource, paper: back.paper });
+      else Object.assign(d, { ink: lineStyle(d.lineart.style)?.ink || t.ink, inkSource: 'swatch', paper: d.lineart.paper });
+      if (d.inkSource === 'photo') { d.inkSource = 'swatch'; d.ink = t.ink; }
+      d.lineart.paper = d.paper;
+    } else if (v === 'realistic') {
       // the first time, the current tool carries over when it is a real drawing tool
       const cand = back?.brush ?? d.brush;
       const real = REAL_TOOLS.some(t => t.brush === cand);
@@ -1074,17 +1111,21 @@ function setMode(v) {
     } else {
       d.mode = 'artistic';
       if (back) Object.assign(d, back);
-      retone(d, styleTone(d.real.style), TONE_DEFAULTS);
     }
-  }, { label: v === 'realistic' ? 'Realistic mode' : 'Artistic mode', thumbs: true });
+  }, { label: `${MODE_NAME[v]} mode`, thumbs: true });
   loupe.fit({ instant: true });
-  if (v === 'realistic' && tabs.find(t => t.getAttribute('aria-selected') === 'true')?.dataset.tab === 'line') selectTab('looks');
+  if (v !== 'artistic' && tabs.find(t => t.getAttribute('aria-selected') === 'true')?.dataset.tab === 'line') selectTab('looks');
   play.f = 1; setPlaying(false);
+  if (v === 'lineart') lineState.revealNext = true;
   announce(v === 'realistic'
     ? `Realistic mode: ${realStyleById(doc.real.style).name}, ${doc.real.toolMm} millimetre ${realToolFor(doc.real.tool).name.toLowerCase()} on a ${formatMm(doc.real.sheetMm)} sheet`
+    : v === 'lineart' ? `Line art mode: ${lineStyle(doc.lineart.style)?.name || 'one-line drawing'}, ${doc.lineart.toolMm} millimetre ${lineToolFor(doc.lineart.tool).name.toLowerCase()}`
     : 'Artistic mode');
 }
+const MODE_NAME = { artistic: 'Artistic', realistic: 'Realistic', lineart: 'Line art' };
 const modeSeg = bindSeg(document.querySelector('[data-bind="mode"]'), doc.mode, v => setMode(v));
+// the Artistic looks "One-line portrait" and "Wandering line" are spiral-born: point to Line art
+$('tryLineArt')?.addEventListener('click', () => setMode('lineart'));
 
 const stylesEl = $('realStyles');
 function buildStyles() {
@@ -1095,11 +1136,13 @@ function buildStyles() {
     b.setAttribute('role', 'radio');
     b.dataset.id = st.id;
     b.title = `${st.letter} · ${st.name} (${i + 1})`;
-    b.innerHTML = '<span class="thumb"><canvas></canvas><span class="skeleton"></span><span class="letter" aria-hidden="true"></span></span><span class="name"></span><span class="blurb"></span>';
+    b.innerHTML = '<span class="thumb"><canvas></canvas><span class="skeleton"></span><span class="letter" aria-hidden="true"></span></span><span class="name"></span><span class="blurb"></span><span class="lineage"></span>';
     b.querySelector('.letter').textContent = st.letter;
     b.querySelector('.name').textContent = st.name;
     b.querySelector('.blurb').textContent = st.blurb;
-    b.setAttribute('aria-label', `${st.letter}: ${st.name}. ${st.blurb}`);
+    b.querySelector('.lineage').textContent = st.lineage || '';
+    if (st.lineage) b.title += ` · ${st.lineage}`;
+    b.setAttribute('aria-label', `${st.letter}: ${st.name}. ${st.blurb}${st.lineage ? ` ${st.lineage}` : ''}`);
     b.addEventListener('click', () => setRealStyle(st.id));
     return b;
   }));
@@ -1243,7 +1286,7 @@ function updateReducedWarn() {
 
 /** The honest numbers: metres of line, time by hand, the tool and the sheet. */
 function updateRealInfo() {
-  if (!realistic()) { updateScaleCaption(null); return; }
+  if (!realistic()) { if (!lineart()) updateScaleCaption(null); return; }
   const r = doc.real, t = realToolFor(r.tool);
   const what = `${toolSizeLabel(t, r.toolMm)} ${t.name.toLowerCase()} on a ${formatSheet(r.sheetMm)} sheet`;
   const g = geom?.real;
@@ -1274,14 +1317,15 @@ function updateRealInfo() {
 function updateScaleCaption(g) {
   const cap = $('realScale');
   if (!cap) return;
-  cap.hidden = !realistic() || !photo;
+  cap.hidden = !(realistic() || lineart()) || !photo;
   if (cap.hidden) return;
-  const r = doc.real, t = realToolFor(r.tool);
+  const la = lineart();
+  const r = la ? { sheetMm: LINE_SHEET_MM, toolMm: doc.lineart.toolMm } : doc.real, t = la ? lineToolFor(doc.lineart.tool) : realToolFor(r.tool);
   // the longest round length up to a quarter of the sheet width
   const cm = [1, 2, 5, 10, 20, 50].filter(c => c * 10 <= r.sheetMm * 0.25).pop() || 1;
   cap.style.setProperty('--bar', `${(cm * 10 / r.sheetMm) * 100}`);
   $('realScaleLen').textContent = cm >= 100 ? `${cm / 100} m` : `${cm} cm`;
-  $('realScaleTxt').textContent = `${formatSheet(r.sheetMm)} · ${toolSizeLabel(t, r.toolMm)} ${t.name.toLowerCase()}${g ? ` · ~${formatHand(g.handSeconds)} by hand` : ''}`;
+  $('realScaleTxt').textContent = `${formatSheet(r.sheetMm)} · ${la ? `${r.toolMm} mm` : toolSizeLabel(t, r.toolMm)} ${t.name.toLowerCase()}${g ? ` · ~${formatHand(g.handSeconds)} by hand` : ''}`;
 }
 
 function syncReal() {
@@ -1364,12 +1408,396 @@ function refreshStyleThumbs() {
   }
 }
 
+// ------------------------------------------------------------------------------------ line art mode
+// One-line drawings the way continuous-line artists make them (js/lineart/index.js): a line model
+// reads the photo's contours once per photo + framing + detail (cached), then a style A-D plans ONE
+// line through them with a hand's pace and pressure (in a worker). The first use downloads the
+// line model (~45 MB, once; the service worker keeps it for offline use), with a card on the sheet.
+let LA = null;                      // the js/lineart/index.js module, once loaded
+const lineState = {
+  engine: null, linesKey: '', linesWant: '', lines: null, inflight: false, lastFrame: '',
+  key: '', want: '', geom: null, failed: '', error: null, revealNext: false, prepared: false,
+};
+const lineStyle = id => (LA ? LA.lineStyleById?.(id) || LA.LINE_STYLES.find(s => s.id === id) : null);
+const lineModP = import('./lineart/index.js').then(m => {
+  if (!m.LineArtEngine || !Array.isArray(m.LINE_STYLES)) throw new Error('lineart: engine missing');
+  LA = m;
+  buildLineStyles();
+  syncControls();
+  if (lineart()) { invalidate('geom'); refreshThumbs(); }
+  return m;
+}).catch(e => {
+  console.warn('Line art is unavailable:', e);
+  lineState.error = 'Line art could not load in this browser.';
+  if (lineart()) updateLineInfo();
+  return null;
+});
+function lineOpts(d = doc) {
+  const la = d.lineart;
+  return { sheetMm: LINE_SHEET_MM, tool: la.tool, toolMm: la.toolMm, wobble: la.wobble, hatch: la.hatch, seed: d.line.seed || 1 };
+}
+const lineFrameKey = () => keyOf(photo.id, doc.crop);
+const lineLinesKey = () => keyOf(lineFrameKey(), doc.lineart.detail.toFixed(2));
+/** Something is still on its way for the current Line art drawing (tests wait on SP.building). */
+function lineBusy() {
+  if (!LA || lineState.error) return !LA && !lineState.error;
+  if (lineState.inflight || lineState.linesKey !== lineLinesKey()) return !lineState.failedLines;
+  const key = keyOf(lineState.linesKey, doc.lineart.style, lineOpts());
+  return lineState.key !== key && lineState.failed !== key;
+}
+
+function computeLineGeometry() {
+  const keep = geom?.lineart ? geom : null;
+  if (!LA) return keep;
+  // framing drags would ask the model for every frame: read the photo once the framing is done
+  if (framing.active) return keep;
+  const lk = lineLinesKey();
+  if (lineState.linesKey !== lk) {
+    if (!lineState.inflight && lineState.failedLines !== lk) requestLines(lk);
+    return keep;
+  }
+  const style = doc.lineart.style, opts = lineOpts();
+  const key = keyOf(lk, style, opts);
+  if (lineState.key === key && lineState.geom) return lineState.geom;
+  if (lineState.want !== key) {
+    lineState.want = key;
+    setBuilding(true);
+    Promise.resolve(lineState.engine.build(style, lineState.lines, opts, { tag: 'stage' })).then(g => {
+      if (lineState.want !== key) return;            // a newer build is on its way
+      setBuilding(false);
+      if (!g) return;
+      lineState.key = key; lineState.geom = g; lineState.failed = '';
+      invalidate('geom');
+      if (lineState.revealNext && lineart()) {
+        lineState.revealNext = false;
+        if (!reducedMotion()) requestAnimationFrame(() => { play.f = 0; setPlaying(true, { demo: true }); });
+      }
+    }, e => {
+      console.warn('line art build failed', e);
+      if (lineState.want !== key) return;
+      setBuilding(false);
+      lineState.failed = key;
+      toast('This drawing could not be made. Try another style or more detail.', { error: true });
+      updateLineInfo();
+    });
+  }
+  return keep;
+}
+
+async function lineEngine() {
+  if (!LA) await lineModP;
+  if (!LA) return null;
+  return (lineState.engine ||= new LA.LineArtEngine());
+}
+
+/** Read the photo's lines for this framing and detail (first use: download the model first). */
+async function requestLines(lk) {
+  lineState.inflight = true;
+  lineState.linesWant = lk;
+  const src = photo, crop = { ...doc.crop }, detail = doc.lineart.detail, frame = lineFrameKey();
+  updateLineInfo();
+  try {
+    const eng = await lineEngine();
+    if (!eng) throw new Error('no engine');
+    if (!lineState.prepared) {
+      try { await eng.prepare(p => gateProgress(p, 'prepare')); }
+      catch (e) { console.warn('line model: prepare failed', e); }   // lines() falls back to the edge finder
+      lineState.prepared = true;
+    }
+    // a new photo or framing runs the model (seconds): say so on the sheet; a new detail only
+    // re-traces the cached line map (a moment): the small "building" label is enough
+    const fresh = lineState.lastFrame !== frame;
+    if (fresh) gateProgress({ stage: 'read', loaded: 0, total: 1 }, 'read');
+    else setBuilding(true, 'Finding the lines…');
+    const r = await eng.lines(src.canvas, crop, { detail }, p => { if (fresh) gateProgress(p, 'read'); });
+    lineState.lines = r;
+    lineState.linesKey = lk;
+    lineState.lastFrame = frame;
+    lineState.failedLines = '';
+  } catch (e) {
+    console.warn('line art: reading the photo failed', e);
+    lineState.failedLines = lk;
+    toast('Line art could not read this photo. Try another photo or framing.', { error: true });
+  } finally {
+    lineState.inflight = false;
+    hideGate();
+    setBuilding(false);
+    updateLineInfo();
+    invalidate('geom');
+    refreshLineThumbs();
+  }
+}
+
+// The card on the sheet: the one-time download (real bytes), then reading the photo (the model
+// gives no steps, so the bar follows the time a read usually takes and says the seconds). The card
+// belongs to Line art only: in the other modes the download and the read go on unseen, and the card
+// comes back at its current progress when the user returns to Line art.
+const gate = { el: null, t0: 0, timer: 0, showAt: 0, stage: '', on: false };
+function gateReveal() {
+  gate.on = true;
+  const el = $('lineGate');
+  if (el) el.hidden = !lineart();
+}
+function syncGate() {
+  const el = $('lineGate');
+  if (el) el.hidden = !(gate.on && lineart());
+}
+function gateProgress(p0, phase) {
+  const el = $('lineGate');
+  if (!el) return;
+  // while reading the photo every stage the engine reports is part of that one read
+  const p = phase === 'read' && p0.stage !== 'ready' ? { ...p0, stage: 'read' } : p0;
+  if (p.stage === 'ready') { if (phase === 'read') hideGate(); return; }
+  const now = performance.now();
+  if (gate.stage === p.stage && p.stage === 'read') return;     // its own timer runs the bar
+  if (gate.stage !== p.stage) { gate.stage = p.stage; gate.t0 = now; }
+  const title = $('lineGateTitle'), sub = $('lineGateSub'), bar = $('lineGateBar');
+  let frac = 0, indeterminate = false;
+  if (p.stage === 'download') {
+    frac = p.total ? p.loaded / p.total : 0;
+    const MB = b => Math.round(b / 1e6);
+    title.textContent = 'Getting the line model ready';
+    sub.textContent = frac >= 0.999 ? `${MB(p.total)} MB, once, then it works offline`
+      : `${MB(p.loaded)} of ${MB(p.total)} MB · once, then it works offline`;
+    // a cached model streams in within a moment: no card for that
+    if (!gate.showAt) gate.showAt = now + 350;
+  } else if (p.stage === 'model' || p.stage === 'face') {
+    title.textContent = 'Getting the line model ready';
+    sub.textContent = p.stage === 'model' ? 'Starting the line model…' : 'Starting the face finder…';
+    indeterminate = true;
+    if (!gate.showAt) gate.showAt = now + 350;
+  } else {
+    title.textContent = 'Reading the photo…';
+    el.classList.remove('indeterminate');
+    if (!gate.showAt) gate.showAt = now + 250;
+    clearInterval(gate.timer);
+    const t0 = gate.t0;
+    const tickRead = () => {
+      const s = (performance.now() - t0) / 1000;
+      // ~10 s is a typical read without WebGPU: approach the end, never claim it
+      const f = 1 - Math.exp(-s / 7);
+      bar.style.setProperty('--p', (f * 95).toFixed(1));
+      bar.setAttribute('aria-valuenow', Math.round(f * 95));
+      sub.textContent = s < 1.5 ? 'Finding the contours a line artist would draw' : `Finding the contours · ${Math.round(s)} s (a read takes about 10–30 s)`;
+      if (gate.on || performance.now() >= gate.showAt) gateReveal();
+    };
+    tickRead();
+    gate.timer = setInterval(tickRead, 250);
+    return;
+  }
+  el.classList.toggle('indeterminate', indeterminate);
+  bar.style.setProperty('--p', (frac * 100).toFixed(1));
+  bar.setAttribute('aria-valuenow', Math.round(frac * 100));
+  if (now >= gate.showAt || gate.on) gateReveal();
+  else setTimeout(() => { if (gate.stage === p.stage && gate.showAt) gateReveal(); }, gate.showAt - now);
+}
+function hideGate() {
+  clearInterval(gate.timer);
+  gate.showAt = 0; gate.stage = ''; gate.on = false;
+  const el = $('lineGate');
+  if (el) { el.hidden = true; el.classList.remove('indeterminate'); }
+}
+
+const lineStylesEl = $('lineStyles');
+function buildLineStyles() {
+  if (!LA) return;
+  lineStylesEl.replaceChildren(...LA.LINE_STYLES.map((st, i) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'style-card';
+    b.setAttribute('role', 'radio');
+    b.dataset.id = st.id;
+    b.title = `${st.letter} · ${st.name} (${i + 1})`;
+    b.innerHTML = '<span class="thumb"><canvas></canvas><span class="skeleton"></span><span class="letter" aria-hidden="true"></span></span><span class="name"></span><span class="blurb"></span>';
+    b.querySelector('.letter').textContent = st.letter;
+    b.querySelector('.name').textContent = st.name;
+    b.querySelector('.blurb').textContent = st.blurb;
+    b.setAttribute('aria-label', `${st.letter}: ${st.name}. ${st.blurb}`);
+    b.addEventListener('click', () => setLineStyle(st.id));
+    return b;
+  }));
+  rovingGrid(lineStylesEl);
+}
+/** A style brings its own tool, paper and ink, and its own detail, wobble and hatching. */
+function setLineStyle(id) {
+  const st = lineStyle(id);
+  if (!st || st.id === doc.lineart.style) return;
+  change(d => {
+    const t = lineToolFor(st.tool);
+    const dflt = st.defaults || {};
+    d.lineart = { ...d.lineart, style: st.id, tool: t.brush, toolMm: st.toolMm || t.sizes[0], paper: st.paper || t.paper,
+      detail: dflt.detail ?? d.lineart.detail, wobble: dflt.wobble ?? d.lineart.wobble, hatch: dflt.hatch ?? d.lineart.hatch };
+    // the approved line-up's exact ink: a palette swatch when it is one, else shown as a custom ink
+    const ink = st.ink || t.ink, inPalette = brushById(t.brush).inks.some(([h]) => h === ink);
+    Object.assign(d, { brush: t.brush, paper: d.lineart.paper, ink, inkSource: inPalette ? 'swatch' : 'custom' });
+  }, { label: `Style: ${st.name}`, thumbs: true });
+  announce(`${st.letter}, ${st.name}`);
+}
+
+const lineToolsEl = $('lineTools');
+function buildLineTools() {
+  lineToolsEl.replaceChildren(...LINE_TOOLS.map(t => {
+    const el = document.createElement('button');
+    el.type = 'button';
+    el.className = 'chip';
+    el.setAttribute('role', 'radio');
+    el.dataset.id = t.brush;
+    const sizes = t.sizes.length > 1 ? `${Math.min(...t.sizes)}–${Math.max(...t.sizes)} mm` : `${t.sizes[0]} mm`;
+    el.title = `${t.name}, ${sizes}${t.pressure ? ', follows pressure' : ', one even width'}`;
+    el.innerHTML = '<span class="thumb"><canvas></canvas><span class="skeleton"></span></span><span class="name"></span><span class="size"></span>';
+    el.querySelector('.name').textContent = t.chip || t.name;
+    el.querySelector('.size').textContent = sizes;
+    el.addEventListener('click', () => setLineTool(t.brush));
+    return el;
+  }));
+  rovingGrid(lineToolsEl);
+}
+function setLineTool(id, mm) {
+  const t = lineToolFor(id);
+  const size = mm ?? (t.brush === doc.lineart.tool ? doc.lineart.toolMm : t.sizes[0]);
+  if (t.brush === doc.lineart.tool && size === doc.lineart.toolMm) return;
+  const b = brushById(t.brush);
+  change(d => {
+    // a new tool keeps an ink it has, else its own dark line-art ink (inkFor would pick its first,
+    // a teal marker); a light ink on a dark sheet stays light
+    if (t.brush !== d.lineart.tool) {
+      const keep = b.inks.some(([h]) => h === d.ink) && !inkMode(b, d.ink, paperById(d.paper)).lowContrast;
+      if (!keep) Object.assign(d, paperById(d.paper).dark ? { ink: inkFor(b), inkSource: 'swatch' } : { ink: t.ink, inkSource: 'swatch' });
+    }
+    d.lineart.tool = d.brush = t.brush; d.lineart.toolMm = size;
+  }, { label: `Tool: ${t.name} ${size} mm`, thumbs: true });
+  announce(`${t.name}, ${size} millimetres${t.pressure ? ', pressure-weighted' : ''}`);
+}
+function buildLineSizes() {
+  const t = lineToolFor(doc.lineart.tool);
+  const host = $('lineSizes');
+  const sizes = [...new Set([...t.sizes, doc.lineart.toolMm])].sort((a, b) => a - b);
+  $('lineSizeRow').hidden = sizes.length < 2;
+  const key = `${t.brush}:${sizes.join(',')}`;
+  if (host.dataset.key === key) return;
+  host.dataset.key = key;
+  host.replaceChildren(...sizes.map(mm => {
+    const b = document.createElement('button');
+    b.type = 'button'; b.setAttribute('role', 'radio'); b.dataset.v = String(mm);
+    b.textContent = `${mm} mm`;
+    return b;
+  }));
+  host.segCtl = bindSeg(host, String(doc.lineart.toolMm), v => setLineTool(t.brush, +v));
+}
+
+const lineArtSliders = {};
+function buildLineSliders2() {
+  const host = $('lineArtSliders');
+  const mk = (key, o) => {
+    const s = sliderRow({
+      ...o, value: doc.lineart[key],
+      format: v => `${Math.round(v * 100)}%`, toEdit: v => Math.round(v * 100), fromEdit: v => v / 100,
+      onInput: (v, dragging) => change(d => { d.lineart[key] = v; }, { live: dragging }),
+      onCommit: () => { commit(o.label); invalidate('geom'); refreshThumbs(); },
+    });
+    lineArtSliders[key] = s;
+    host.append(s.el);
+  };
+  mk('detail', { label: 'Detail', min: 0, max: 1, step: 0.05, def: 0.45, hint: 'How many of the photo’s contours the line keeps' });
+  mk('hatch', { label: 'Hatching', min: 0, max: 1, step: 0.05, def: 0, hint: 'Loose hatching in the darkest parts, drawn as part of the same line' });
+  mk('wobble', { label: 'Wobble', min: 0, max: 1, step: 0.05, def: 0.3, hint: 'How much the hand drifts, overshoots and loops' });
+}
+const lineLightSeg = bindSeg(document.querySelector('[data-bind="lineLight"]'), doc.lineart.light, v =>
+  change(d => { d.lineart.light = v; }, { label: `Light: ${LIGHT_NAME[v]}`, level: 'render' }));
+
+/** The honest numbers: metres of line, time by hand, the tool; and which engine drew the lines. */
+function updateLineInfo() {
+  if (!lineart()) return;
+  const el = $('lineInfo'), note = $('lineNote');
+  const la = doc.lineart, t = lineToolFor(la.tool);
+  const what = `${la.toolMm} mm ${t.name.toLowerCase()}`;
+  const g = geom?.lineart;
+  const current = g && lineState.key === keyOf(lineLinesKey(), la.style, lineOpts()) && geom === lineState.geom;
+  if (lineState.error) el.textContent = lineState.error;
+  else if (!photo) el.textContent = `Choose a photo · ${what}`;
+  else if (current && !$('sheet').classList.contains('building')) {
+    const m = +g.lengthM;
+    el.innerHTML = `<b>${m.toFixed(1)} m</b> of line · about <b>${formatHand(g.handSeconds)}</b> by hand · `;
+    el.append(what);
+  } else if (lineState.failedLines && lineState.failedLines === lineLinesKey()) el.textContent = `Could not read this photo · ${what}`;
+  else if (lineState.inflight && lineState.lastFrame !== lineFrameKey()) el.textContent = `Reading the photo… · ${what}`;
+  else el.textContent = `Drawing the line… · ${what}`;
+  // an honest note when the line model could not run here and the edge finder drew the lines
+  const lines = lineState.lines, fallback = lines && lines.engine === 'xdog';
+  // a photo with nothing to draw (feature-detected: the planner flags geom.lineart.empty)
+  const empty = !!(current && g.empty);
+  note.hidden = !fallback && !empty;
+  if (empty) note.textContent = 'No clear contours in this photo, so there is little for a line artist to draw. Try a photo with a clear subject: a face, an animal or an object.';
+  else if (fallback) note.textContent = 'The line model could not load here, so a simpler edge finder read the photo: the lines are rougher and follow shadows more. It is still one line.';
+  updateScaleCaption(current ? g : null);
+}
+
+function syncLine() {
+  const la = doc.lineart, st = lineStyle(la.style), t = lineToolFor(la.tool);
+  setChecked([...lineStylesEl.children], el => el.dataset.id === la.style);
+  $('lineStyleValue').textContent = st ? `${st.letter} · ${st.name}` : '';
+  for (const [k, s] of Object.entries(lineArtSliders)) s.set(la[k]);
+  setChecked([...lineToolsEl.children], el => el.dataset.id === la.tool);
+  $('toolValue').textContent = `${t.name} · ${la.toolMm} mm`;
+  buildLineSizes();
+  $('lineSizes').segCtl?.set(String(la.toolMm));
+  $('lineToolHelp').textContent = t.pressure
+    ? `${t.name}: the width follows the hand, fuller where it slows or presses into the darks.`
+    : `${t.name}: one even width, like the real pen.`;
+  lineLightSeg.set(la.light);
+  updateLineInfo();
+}
+
+// Style cards: the user's photo in each style, planned from the SAME cached lines (a build of a
+// few hundred ms in the worker, no model run), each in its own tool, paper and ink.
+const lineThumbGeoms = new Map();
+function refreshLineThumbs() {
+  if (!photo || !lineart() || !LA || !lineState.lines || lineState.linesKey !== lineLinesKey()) return;
+  const dpr = DPR();
+  for (const el of lineStylesEl.children) {
+    const st = lineStyle(el.dataset.id);
+    const canvas = el.querySelector('canvas');
+    const size = Math.round((canvas.clientWidth || 120) * dpr);
+    const t = lineToolFor(st.tool), b = brushById(t.brush), p = paperById(st.paper || t.paper), ink = st.ink || t.ink;
+    const m = inkMode(b, ink, p);
+    // at least ~1.1 card pixels wide, so a 0.55 mm nib still reads on a 250 px card
+    const opts = { sheetMm: LINE_SHEET_MM, tool: t.brush, toolMm: +Math.max(st.toolMm, 1.1 * LINE_SHEET_MM / Math.max(size, 1)).toFixed(3),
+      wobble: st.defaults?.wobble ?? 0.3, hatch: st.defaults?.hatch ?? 0, seed: 1 };
+    const gk = keyOf('linethumb', st.id, lineState.linesKey, opts);
+    const key = keyOf(gk, size, m.cover);
+    if (canvas.dataset.key === key) continue;
+    const show = g => thumbs.add({
+      canvas, key, width: size, height: size, needs: { brush: b, paper: p },
+      render: r => {
+        r.setLayout(LAYOUT); r.setPaper(p, 1);
+        r.setStyle({ brush: b, ink, cover: m.cover, photoColor: false });
+        r.setGeometry(g); return r.render(Infinity);
+      },
+    }, st.id === doc.lineart.style);
+    const have = lineThumbGeoms.get(gk);
+    if (have) { show(have); continue; }
+    const lines = lineState.lines;
+    setTimeout(() => {
+      if (!lineart() || lineState.lines !== lines) return;
+      Promise.resolve(lineState.engine.build(st.id, lines, opts, { tag: `thumb:${st.id}` })).then(g => {
+        if (!g) return;
+        lineThumbGeoms.set(gk, g);
+        if (lineThumbGeoms.size > 16) lineThumbGeoms.delete(lineThumbGeoms.keys().next().value);
+        if (lineart()) show(g);
+      }).catch(e => console.warn('line art thumb failed', e));
+    }, 80);
+  }
+}
+
 // ------------------------------------------------------------------------------------ sync UI from doc
 function syncControls() {
   const b = brush(), p = paper();
   document.body.classList.toggle('realistic', realistic());
+  document.body.classList.toggle('lineart', lineart());
   modeSeg.set(doc.mode);
-  $('tabLooksName').textContent = realistic() ? 'Style' : 'Looks';
+  syncGate();
+  syncWelcome();
+  $('tabLooksName').textContent = doc.mode === 'artistic' ? 'Looks' : 'Style';
   setChecked([...looksEl.children], el => el.dataset.id === doc.look);
   const edited = lookEdited();
   for (const el of looksEl.children) {
@@ -1416,6 +1844,7 @@ function syncControls() {
   updateHints();
   updateArtLabel();
   if (realistic()) syncReal();
+  if (lineart()) syncLine();
 }
 
 function updateHints() {
@@ -1455,8 +1884,10 @@ function updateArtLabel() {
   clearTimeout(updateArtLabel.t);
   updateArtLabel.t = setTimeout(() => {
     const what = photo ? (photo.sample ? `The ${photo.name} sample` : 'Your photo') : 'A blank sheet';
-    const r = doc.real;
-    art.setAttribute('aria-label', photo && realistic()
+    const r = doc.real, la = doc.lineart;
+    art.setAttribute('aria-label', photo && lineart()
+      ? `${what} drawn as a one-line ${lineStyle(la.style)?.name || 'line art'} drawing with a ${la.toolMm} millimetre ${lineToolFor(la.tool).name.toLowerCase()} on ${paper().name} paper.`
+      : photo && realistic()
       ? `${what} drawn in the ${realStyleById(r.style).name.toLowerCase()} style as one ${r.toolMm} millimetre line of a ${realToolFor(r.tool).name.toLowerCase()} on a ${formatMm(r.sheetMm)} sheet of ${paper().name} paper.`
       : photo
       ? `${what} drawn as one spiral line with a ${brush().name.toLowerCase()} in ${photoColor() ? 'colours from the photo' : inkName(brush(), doc.ink).toLowerCase() + ' ink'} on ${paper().name} paper, ${doc.line.rings} rings.`
@@ -1504,14 +1935,17 @@ function refreshThumbs(photoChanged = false) {
     }
   }
   refreshStyleThumbs();
-  // tool chips: a spiral fragment in each tool, on the current paper (Artistic and Realistic grids)
+  refreshLineThumbs();
+  // tool chips: a spiral fragment in each tool, on the current paper (every mode's grid)
   const p = paper();
-  for (const el of [...toolsEl.children, ...realToolsEl.children]) {
+  for (const el of [...toolsEl.children, ...realToolsEl.children, ...lineToolsEl.children]) {
     const b = brushById(el.dataset.id);
     const canvas = el.querySelector('canvas');
     const w = Math.round((canvas.clientWidth || 70) * dpr), h = Math.round((canvas.clientHeight || 52) * dpr);
     const pp = chipPaperFor(b, p);
-    const ink = photoColor() ? b.inks[0][0] : inkFor(b, pp);
+    // Line art's chips show each tool in its own dark line-art ink
+    const lineChip = el.parentElement === lineToolsEl && !pp.dark;
+    const ink = photoColor() ? b.inks[0][0] : lineChip ? lineToolFor(b.id).ink : inkFor(b, pp);
     const m = inkMode(b, ink, pp);
     const tech = doc.line.technique === 'wave' ? 'wave' : 'thickness';
     // wet media: the pen pauses once where the chip shows it, so it pools there and the ink's
@@ -1562,6 +1996,7 @@ function scheduleIdleWork() {
 // ------------------------------------------------------------------------------------ photos
 async function setPhoto(img, { sample = false, crop = null, demo = true, announceIt = true } = {}) {
   photo = { ...img, id: ++photoSeq, sample };
+  lineState.revealNext = lineart();
   loupe.fit({ instant: true });
   doc.crop = crop ? { ...CROP_DEFAULTS, ...crop } : autoCrop(img);
   delete thumbCache.rk;
@@ -1655,6 +2090,14 @@ window.addEventListener('paste', e => {
 });
 
 // ------------------------------------------------------------------------------------ welcome
+/** The welcome card's sentence follows the mode (switching modes on the welcome screen too). */
+function syncWelcome() {
+  const w = $('welcome');
+  if (!w || w.hidden || w.dataset.back) return;
+  $('welcomeLede').textContent = realistic() ? 'Choose an image and watch it drawn as one real line, at the pace of a hand.'
+    : lineart() ? 'Choose a photo and watch it drawn as one continuous line, feature by feature, the way a line artist would.'
+    : 'Choose an image and watch it drawn as a single, unbroken spiral.';
+}
 function hideWelcome() {
   $('welcome').hidden = true;
   document.body.classList.remove('welcoming');
@@ -1792,6 +2235,7 @@ $('frCancel').addEventListener('click', () => exitFraming(false));
 $('frDone').addEventListener('click', () => exitFraming(true));
 $('btnFrame').addEventListener('click', () => (framing.active ? exitFraming(true) : enterFraming()));
 $('btnFrame2').addEventListener('click', () => enterFraming());
+$('btnFrame3').addEventListener('click', () => enterFraming());
 
 // ------------------------------------------------------------------------------------ compare
 function setCompare(on) {
@@ -1897,8 +2341,11 @@ async function openDownload(quick = false) {
   const d = (await loadDialogs()).download;
   // Realistic: the files are real-size (the SVG is a plotter file of the real sheet and pen)
   const note = $('dlRealNote');
-  note.hidden = !geom?.real;
-  if (geom?.real) {
+  note.hidden = !geom?.real && !geom?.lineart;
+  if (geom?.lineart) {
+    const L = geom.lineart, t = lineToolFor(L.tool || doc.lineart.tool);
+    note.textContent = `Line art: ${(+L.lengthM).toFixed(1)} m of one line with a ${L.toolMm} mm ${t.name.toLowerCase()}, on a ${formatMm(L.sheetMm || LINE_SHEET_MM)} square sheet. The PNG is that sheet rendered; the SVG is it at real size.`;
+  } else if (geom?.real) {
     const r = geom.real;
     note.textContent = `Realistic: the SVG is a real-size plotter file — one path, ${r.toolMm} mm stroke, ${formatMm(r.sheetMm)} × ${formatMm(r.sheetMm)} sheet, ${r.lengthM.toFixed(1)} m of line. The PNG is the rendered sheet.`;
   }
@@ -1954,7 +2401,17 @@ window.addEventListener('keydown', e => {
   if ((k === '+' || k === '=') && photo) { e.preventDefault(); loupe.zoomBy(2); return; }
   if ((k === '-' || k === '_') && photo) { e.preventDefault(); loupe.zT / 2 <= 1.05 ? loupe.fit() : loupe.zoomBy(0.5); return; }
   if (k === '0' && photo) { e.preventDefault(); loupe.fit(); return; }
-  if (k === 'm' || k === 'M') { e.preventDefault(); setMode(realistic() ? 'artistic' : 'realistic'); return; }
+  if (k === 'm' || k === 'M') { e.preventDefault(); setMode(MODES[(MODES.indexOf(doc.mode) + 1) % MODES.length]); return; }
+  if (lineart()) {
+    // 1-4 pick the style (A-D), [ and ] take less or more of the photo
+    if (/^[1-4]$/.test(k)) { e.preventDefault(); setLineStyle(LINE_STYLE_IDS[+k - 1]); return; }
+    if (k === '[' || k === ']') {
+      e.preventDefault();
+      const v = +clamp(doc.lineart.detail + (k === ']' ? 0.1 : -0.1), 0, 1).toFixed(2);
+      if (v !== doc.lineart.detail) { change(d => { d.lineart.detail = v; }, { label: 'Detail', thumbs: true }); announce(`Detail ${Math.round(v * 100)}%`); }
+    }
+    return;
+  }
   if (realistic()) {
     // 1-4 pick the style (A-D), [ and ] step the detail preset
     if (/^[1-4]$/.test(k)) { e.preventDefault(); setRealStyle(REAL_STYLES[+k - 1].id); return; }
@@ -1982,6 +2439,8 @@ async function boot() {
   buildStyles();
   buildTools();
   buildRealTools();
+  buildLineTools();
+  buildLineSliders2();
   buildInks();
   inksEl.dataset.brush = doc.brush;
   buildPapers();
@@ -1998,12 +2457,13 @@ async function boot() {
 
   const session = await loadPhoto();
   const welcome = $('welcome');
-  if (realistic()) $('welcomeLede').textContent = 'Choose an image and watch it drawn as one real line, at the pace of a hand.';
   welcome.hidden = false;
+  syncWelcome();
   document.body.classList.add('welcoming');
   buildSamples();
   layoutStage();
   if (session?.blob) {
+    welcome.dataset.back = '1';
     $('welcomeTitle').innerHTML = 'Welcome <em>back.</em>';
     $('welcomeLede').textContent = 'Your last style is ready. Continue with your photo or choose a new one.';
     const cont = $('btnContinue');
@@ -2038,9 +2498,10 @@ window.SP = {
   get doc() { return doc; }, get prefs() { return prefs; }, get geom() { return geom; }, get photo() { return photo; },
   get toneStats() { return cache.tone?.stats; },
   play, renderer, loupe, change, applyLook, setBrush, setPaper, openSample, enterFraming, exitFraming,
-  setMode, setRealStyle, setRealTool, realBuilder, get building() {
+  setMode, setRealStyle, setRealTool, realBuilder, setLineStyle, setLineTool, lineState, get building() {
     return $('sheet').classList.contains('building') || realBuilder.busy
-      || (realistic() && !!photo && (realState.dirty || (realState.want !== realState.key && realState.want !== realState.failed)));
+      || (realistic() && !!photo && (realState.dirty || (realState.want !== realState.key && realState.want !== realState.failed)))
+      || (lineart() && !!photo && lineBusy());
   },
   openFilm, openDownload, invalidate, renderState, history,
   async shot(name = 'app') {

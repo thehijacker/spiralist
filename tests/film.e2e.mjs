@@ -12,6 +12,9 @@
 //        [--preset detailed] [--light window|raking|overhead] [--no-counter]
 //          (Realistic mode, "true drawing, sped up": the app's own setMode / setRealStyle / setRealTool;
 //          checks window.__filmLast.real and adds the 'macro' moment, the real-speed opening)
+//        [--share-x]   (press Post on X on the result: X's composer opens, the video is saved)
+//        [--lineart picasso|matisse|blind|brush]   (Line art mode: the app's setMode('lineart') / setLineStyle;
+//          the true drawing at near real speed; checks __filmLast.real.lineart, adds 'macro' and 'card')
 // Prints the probe (frame count must equal length x fps), the composer's timing
 // (window.__filmLast) and writes shots/e2e_<tag>.mp4 plus shots/e2e_<tag>_<moment>.jpg.
 import { createRequire } from 'node:module';
@@ -30,8 +33,9 @@ const style = opt('style', 'cinematic'), fps = +opt('fps', style === 'cinematic'
 const path = opt('path', flag('maze') || opt('maze-at', null) ? 'maze' : 'spiral');
 const maze = path !== 'spiral';
 const desk = opt('desk', null);
-const real = opt('real', null);
-const tag = [browserName, format, `${length}s`, style, `${fps}fps`, real ? `real-${real}-${opt('tool', '')}${opt('sheet', '')}` : maze ? path : flag('edge') ? 'edge' : 'spiral',
+const lineart = opt('lineart', null);
+const real = opt('real', null) || (lineart ? 'lineart' : null);
+const tag = [browserName, format, `${length}s`, style, `${fps}fps`, lineart ? `lineart-${lineart}` : real ? `real-${real}-${opt('tool', '')}${opt('sheet', '')}` : maze ? path : flag('edge') ? 'edge' : 'spiral',
   opt('look', ''), opt('brush', ''), desk || '', flag('reveal') ? 'reveal' : '', opt('sign', null) ? 'signed' : ''].filter(Boolean).join('_');
 const browser = await pw[browserName].launch(browserName === 'chromium'
   ? { headless: true, args: ['--use-angle=d3d11', '--enable-gpu', '--ignore-gpu-blocklist'] } : { headless: true });
@@ -39,13 +43,18 @@ const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
 const logs = [];
 page.on('console', m => { if (['error', 'warning'].includes(m.type())) logs.push(`[${m.type()}] ${m.text()}`); });
 page.on('pageerror', e => logs.push('[pageerror] ' + e.message));
-await page.goto('http://localhost:8830/');
+await page.goto(`http://localhost:${opt('port', 8830)}/`);
 await page.waitForFunction(() => window.SP && window.SP.geom && !window.SP.play.playing, null, { timeout: 60000 });
 if (opt('sample', null)) await page.evaluate(id => SP.openSample(id, { demo: false }), opt('sample'));
 if (opt('look', null)) await page.evaluate(id => SP.applyLook(id), opt('look'));
 if (opt('brush', null)) await page.evaluate(id => SP.setBrush(id), opt('brush'));
 if (opt('paper', null)) await page.evaluate(id => SP.setPaper(id), opt('paper'));
-if (real) {
+if (lineart) {
+  // the first Line art drawing downloads and runs the line model (5-15 s on the wasm path)
+  await page.evaluate(style => { SP.setMode('lineart'); SP.setLineStyle(style); }, lineart);
+  await page.waitForFunction(s => window.SP.geom?.path === 'lineart' && window.SP.geom.lineart?.style === s && !window.SP.building,
+    lineart, { timeout: 240000, polling: 250 });
+} else if (real) {
   await page.evaluate(({ style, tool, mm, sheet, preset, light }) => {
     SP.setMode('realistic');
     SP.setRealStyle(style);
@@ -72,7 +81,7 @@ if (real) {
 }
 await page.evaluate(({ format, length, reveal, tool, style, fps, pacing, desk, counter }) => {
   const f = SP.prefs.film;
-  f.format = format; f.length = length; f.lengthChosen = true; f.reveal = reveal; f.showTool = tool; f.style = style; f.fps = fps; f.fpsChosen = true;
+  f.format = format; f.length = length; f.lengthChosen = !!length; f.reveal = reveal; f.showTool = tool; f.style = style; f.fps = fps; f.fpsChosen = true;
   if (desk) f.desk = desk;
   if (pacing) SP.prefs.pacing = pacing;
   f.counter = counter;
@@ -88,6 +97,8 @@ if (opt('sign', null)) {
 }
 await page.waitForTimeout(600);
 const summary = await page.textContent('#filmSummary');
+const modeAtGo = await page.evaluate(async () => ({ mode: SP.doc.mode, path: SP.geom?.path, style: SP.geom?.lineart?.style || SP.geom?.real?.style || null,
+  info: !!(await import('/js/film.js')).realInfo(SP.geom), building: SP.building }));
 // --prefix rf: name the files shots/rf_<tag>… (the realistic film's shots)
 const prefix = opt('prefix', 'e2e');
 if (flag('dialog-shot')) await page.locator('#filmDialog').screenshot({ path: `shots/${prefix}_${tag}_dialog.png` });
@@ -125,8 +136,8 @@ if (ok && !(await page.isHidden('#filmResult'))) {
   const moments = { intro: 0.35, 25: length * 0.25, 50: length * 0.5, 75: length * 0.75, end: Math.max(0, length - 0.3),
     sign: timing?.sign ? timing.sign.t0 + 0.7 * (timing.sign.t1 - timing.sign.t0) : null, final: length - 1 / fps / 2,
     // realistic: inside the real-speed opening (the macro), and early in the follow shot
-    macro: timing?.real ? 0.4 + 0.8 * timing.real.open : 2, follow: length * 0.15 };
-  const want = (opt('frames', opt('sign', null) ? 'intro,25,50,75,end,sign,final' : real ? 'macro,follow,50,75,end' : 'intro,25,50,75,end')).split(',');
+    macro: timing?.real ? 0.4 + 0.8 * timing.real.open : 2, follow: length * 0.15, card: length - 0.4 };
+  const want = (opt('frames', opt('sign', null) ? 'intro,25,50,75,end,sign,final' : lineart ? 'macro,follow,50,75,end,card' : real ? 'macro,follow,50,75,end' : 'intro,25,50,75,end')).split(',');
   for (const name of want) {
     const t = moments[name] ?? +name;
     if (t == null || !Number.isFinite(t)) continue;
@@ -137,12 +148,25 @@ if (ok && !(await page.isHidden('#filmResult'))) {
     try { execFileSync('ffmpeg', ['-v', 'error', '-y', ...a]); } catch { /* ignore */ }
   }
 }
+// --share-x: press Post on X on the result (a desktop opens X's composer and saves the video to attach)
+let shareX;
+if (flag('share-x') && file) {
+  const pop = page.waitForEvent('popup', { timeout: 8000 }).catch(() => null);
+  const dl = page.waitForEvent('download', { timeout: 8000 }).catch(() => null);
+  await page.click('#filmShareX');
+  const [p, d] = await Promise.all([pop, dl]);
+  await page.waitForTimeout(500);
+  shareX = { popup: p ? p.url().slice(0, 80) : null, download: d ? d.suggestedFilename() : null, toast: (await page.textContent('#toasts').catch(() => '')).slice(0, 120) };
+  if (check) check.shareXOk = !!(shareX.popup || shareX.download);
+}
 if (real && check) {
   // the realistic film must have been filmed as one (the hand's clock, the real sheet)
   const R = timing?.real;
-  check.realOk = !!R && R.style === real && R.handSeconds > 0 && R.peak >= 1 && R.length === length;
+  check.realOk = !!R && R.style === (lineart || real) && R.handSeconds > 0 && R.peak >= 1 && R.length === length;
+  // Line art: near real speed (a few x, never slowed below 1x), the macro opening, the looks
+  if (lineart) check.lineartOk = !!R?.lineart && R.avg >= 1 && R.avg <= 20 && R.lineart.macro && R.lineart.pauses > 0;
 }
 const hand = real ? await page.textContent('#filmHand').catch(() => '') : undefined;
-console.log(JSON.stringify({ browser: browserName, format, length, style, fps, maze, path, desk, summary, hand, secs, meta, toast: toastText, file, check, timing, probe: probe?.streams?.[0] }, null, 1));
+console.log(JSON.stringify({ browser: browserName, format, length, style, fps, maze, path, desk, summary, hand, modeAtGo, shareX, secs, meta, toast: toastText, file, check, timing, probe: probe?.streams?.[0] }, null, 1));
 if (logs.length) console.log(logs.slice(0, 30).join('\n'));
 await browser.close();

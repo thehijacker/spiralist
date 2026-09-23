@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { cameraBasis, project, unproject as unprojectDesk, planeTransform, planCamera, planPace, shotIntent, lens, SHOT, MACRO, deskBakeSize } from '../js/scene.js';
 import { DESKS, deskById, DESK_GLSL } from '../js/desks.js';
-import { sheetPlace, FORMATS, drawSeconds, signSeconds, planHandPace, realInfo, formatHand, formatSpeed } from '../js/film.js';
+import { sheetPlace, FORMATS, drawSeconds, signSeconds, planHandPace, realInfo, formatHand, formatSpeed, filmLengthFor, filmDrawSeconds } from '../js/film.js';
 import { cleanSignature, timeSignature, placeSignature, SIGNATURE_MAX } from '../js/signature.js';
 
 let failures = 0;
@@ -426,6 +426,36 @@ test('realistic shots: sizes in mm override the defaults; a big sheet keeps the 
   assert.ok(Math.abs(lens(b, [0, 0]).K / k1 - 0.21) < 1e-9, 'aperture scales with b.ap');
   delete b.ap;
   assert.equal(lens(b, [0, 0]).K, k1);
+});
+
+test('line art clock: looks found and stretched, 15/30/60 s films, the total said to the second', () => {
+  // a straight line at 20 mm/s (0.1 mm per point on a 210 mm sheet), with a 0.8 s look before point 600
+  const n = 1001, data = new Float32Array(n * 7), handT = new Float32Array(n);
+  const mmPerCu = 210 * 0.42, step = 0.1 / mmPerCu;
+  for (let i = 0; i < n; i++) {
+    data[i * 7] = i * step;
+    data[i * 7 + 6] = 1;
+    if (i) handT[i] = handT[i - 1] + 0.1 / 20 + (i === 600 ? 0.8 : 0);
+  }
+  const g = { n, data, path: 'lineart', layout: { r: 0.42 }, handT,
+    lineart: { style: 'matisse', sheetMm: 210, toolMm: 0.55, handSeconds: +handT[n - 1].toFixed(1), lengthM: 0.1, retracedM: 0.02 } };
+  const R = realInfo(g);
+  assert.ok(R && R.lineart, 'a Line art geometry films as a true drawing');
+  assert.equal(R.style, 'matisse');
+  assert.equal(R.pauses, 1);
+  assert.ok(Math.abs(R.pauseSeconds - 0.8) < 0.01, `pause ${R.pauseSeconds}`);
+  // the film clock plays the look slower than the line (and only the look)
+  assert.ok(Math.abs(R.clock.total - (handT[n - 1] + 0.8)) < 0.01);
+  // lengths: 30 s by default, a hand-picked 15/30/60 kept, 10 s never
+  assert.equal(filmLengthFor({ length: 10 }, g), 30);
+  assert.equal(filmLengthFor({ length: 60, lengthChosen: true }, g), 60);
+  assert.equal(filmLengthFor({ length: 10, lengthChosen: true }, g), 15);
+  assert.equal(filmLengthFor({ length: 10, lengthChosen: true }, { n, data, path: 'spiral' }), 10);
+  // a drawing shorter than the film at real speed is drawn at 1x: the transport previews that
+  assert.ok(Math.abs(filmDrawSeconds({ length: 30, style: 'cinematic' }, g) - (R.clock.total + 0.2)) < 1e-9);
+  assert.equal(filmDrawSeconds({ length: 10, style: 'cinematic' }, { n, data, path: 'spiral' }), drawSeconds(10, false, 'cinematic', 0));
+  assert.equal(formatHand(122, 'total'), '2 min 02 s');
+  assert.equal(formatHand(4000, 'total'), '1 h 07 min');
 });
 
 if (failures) { console.log(`\n${failures} failing`); process.exit(1); }

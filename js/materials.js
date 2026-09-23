@@ -99,3 +99,20 @@ export const REAL_TOOLS = [
   { brush: 'chalk', name: 'Chalk', sizes: [5], ink: '#f3f0e8', paper: 'chalkboard' },
 ];
 export const realToolFor = brushId => REAL_TOOLS.find(t => t.brush === brushId) || REAL_TOOLS[0];
+
+/**
+ * Line art mode's tools: what continuous-line artists draw with, at real widths (mm; first =
+ * default). pressure: the width follows the hand (a nib swells where it slows, a brush presses in
+ * the darks); the others keep one width, like the real pen. ink = a dark ink from the tool's own
+ * palette (a line artist's marker is black, not the Artistic look's teal).
+ */
+export const LINE_TOOLS = [
+  { brush: 'fineliner', name: 'Fineliner', sizes: [0.5, 0.3, 0.8], ink: '#17171a', paper: 'cream', pressure: false },
+  { brush: 'ballpoint', name: 'Ballpoint', sizes: [0.5], ink: '#1d3a8a', paper: 'cream', pressure: false },
+  { brush: 'fountain', name: 'Fountain nib', chip: 'Nib', sizes: [0.55, 0.4, 0.8], ink: '#101012', paper: 'cream', pressure: true },
+  { brush: 'pencil', name: 'Soft pencil', chip: 'Pencil', sizes: [0.8, 0.5], ink: '#2a2a2e', paper: 'sketch', pressure: true },
+  { brush: 'brush', name: 'Sumi brush', chip: 'Brush', sizes: [1.5, 1, 2.5], ink: '#0e0e0e', paper: 'coldpress', pressure: true },
+  { brush: 'marker', name: 'Marker', sizes: [1.3, 2], ink: '#2d2a32', paper: 'sketch', pressure: false },
+  { brush: 'charcoal', name: 'Charcoal pencil', chip: 'Charcoal', sizes: [1.2, 2], ink: '#1b1715', paper: 'coldpress', pressure: true },
+];
+export const lineToolFor = brushId => LINE_TOOLS.find(t => t.brush === brushId) || LINE_TOOLS[2];

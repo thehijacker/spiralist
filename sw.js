@@ -24,7 +24,8 @@ self.addEventListener('install', e => {
 
 self.addEventListener('activate', e => {
   e.waitUntil(caches.keys()
-    .then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
+    // only our own old caches: other sites on the same origin (winchxyz.github.io) keep theirs
+    .then(keys => Promise.all(keys.filter(k => k.startsWith('spiralist-') && k !== CACHE).map(k => caches.delete(k))))
     .then(() => self.clients.claim()));
 });
 

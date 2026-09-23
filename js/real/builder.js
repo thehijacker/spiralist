@@ -6,7 +6,8 @@
 //   const geom = await b.build(style, field, opts, { tag: 'stage', priority: true });
 //   // null when a newer job with the same tag replaced this one before it started
 //
-// One job runs at a time; priority jobs (the stage) go before queued thumbnails. The hand clock is
+// One job runs at a time; priority jobs (the stage) go before queued thumbnails, and a thumbnail
+// already running is stopped (the worker is replaced) and run again after the stage. The hand clock is
 // reinstalled as the geometry's pacing tables on arrival (Maps do not need to cross the thread).
 
 import { buildReal, installHandPacing } from './index.js';
@@ -35,6 +36,7 @@ export class RealBuilder {
         const i = this.queue.findIndex(q => !q.priority);
         job.priority = true;
         this.queue.splice(i < 0 ? this.queue.length : i, 0, job);
+        if (this.current && !this.current.priority && this.worker) this._preempt();
       } else this.queue.push(job);
       this._pump();
     });
@@ -62,6 +64,17 @@ export class RealBuilder {
       this.worker = null;
     }
     return this.worker;
+  }
+
+  /** A card's build must not hold up the stage: stop it (a running job cannot be interrupted any
+   * other way) and queue it again after the priority jobs. */
+  _preempt() {
+    const job = this.current;
+    this.current = null;
+    try { this.worker.terminate(); } catch { /* gone */ }
+    this.worker = null;
+    const i = this.queue.findIndex(q => !q.priority);
+    this.queue.splice(i < 0 ? this.queue.length : i, 0, job);
   }
 
   _pump() {

@@ -17,7 +17,7 @@ import { build as buildSquiggle, squiggleScale, PRESETS as SQUIGGLE_PRESETS, SQU
 import { build as buildStipple } from './stipple.js';
 import { build as buildScribble } from './scribble.js';
 import { build as buildEngrave, ENGRAVE_PRESETS } from './engrave.js';
-import { STRIDE } from '../spiral.js';
+import { STRIDE, MAX_POINTS } from '../spiral.js';
 
 export const LAYOUT_R = 0.42;
 
@@ -66,6 +66,16 @@ function engraveLevels(o) {
  *   B stipple:  a stick on A0 is a worm maze; on 150 cm a portrait (round 2 art review) -> ~350
  *   C scribble: likewise; at 140 a stick drew a SHORTER drawing than a pen on A4       -> ~330
  *   D engrave:  ~100 bands of 3-5 lines (1 m barely reads)  -> ~360 (150 cm for a stick)
+ * maxSheetRatio = the largest sheet width / tool width whose line still fits one drawing
+ * (MAX_POINTS) without lowering detail, measured on a mostly dark photo at Detailed (a lighter
+ * photo has room to spare): past it the sheet is offered disabled, and a sheet picked by hand snaps
+ * back. It is not a guarantee: a near-black photo or a finer preset can still lower detail below
+ * it, so every build also reports real.load (its full-detail line per budget) and the sheet list
+ * marks the sizes where this photo will lose detail. Measured with the budget-aware builders (fineliner 0.3 / 0.4 mm on 21 cm to 1 m):
+ *   A squiggle: 0.4 mm on A1 (1485) fits, 0.3 mm on A1 (1980) drops rings      -> 1600
+ *   B stipple:  0.4 mm on A1 fits for a portrait, not for a dark photo           -> 1400
+ *   C scribble: 0.4 mm on A2 (1050) fits a dark photo, 0.3 mm on A2 (1400) not   -> 1320
+ *   D engrave:  0.4 mm on A0 (2100) fits with coarser columns, 0.3 mm on A0 not  -> 2400
  * tone = tone settings merged over the user's untouched defaults; fieldRings = the blur scale of
  * the darkness field each builder was tuned with.
  */
@@ -73,28 +83,28 @@ export const REAL_STYLES = [
   {
     id: 'squiggle', letter: 'A', name: 'Squiggle spiral',
     blurb: 'One spiral from the centre that zigzags tighter where the photo is dark.',
-    build: buildSquiggle, presets: SQUIGGLE_PRESETS, minSheetRatio: 360, tone: SQUIGGLE_TONE, shape: 'circle',
+    build: buildSquiggle, presets: SQUIGGLE_PRESETS, minSheetRatio: 360, maxSheetRatio: 1600, tone: SQUIGGLE_TONE, shape: 'circle',
     fieldRings: o => squiggleScale(o).rings,
     options: o => ({ speedMm: isStick(o.toolMm) ? 60 : 40, wiggleHz: isStick(o.toolMm) ? 3 : 5 }),
   },
   {
     id: 'stipple', letter: 'B', name: 'Stipple tour',
     blurb: 'A maze-like tour through thousands of dots, packed where it is dark.',
-    build: buildStipple, presets: null, minSheetRatio: 350, tone: {}, shape: 'square',
+    build: buildStipple, presets: null, minSheetRatio: 350, maxSheetRatio: 1400, tone: {}, shape: 'square',
     fieldRings: o => Math.max(12, Math.round(1 / (1.2 * tCU(o.toolMm, o.sheetMm)))),
     options: () => ({}),
   },
   {
     id: 'scribble', letter: 'C', name: 'Scribble',
     blurb: 'Circling loops that pile up in the shadows, like ballpoint shading.',
-    build: buildScribble, presets: null, minSheetRatio: 330, tone: {}, shape: 'square',
+    build: buildScribble, presets: null, minSheetRatio: 330, maxSheetRatio: 1320, tone: {}, shape: 'square',
     fieldRings: () => 110,
     options: o => ({ markRatio: MARK_RATIO[o.tool] || 1 }),
   },
   {
     id: 'engrave', letter: 'D', name: 'Flow engraving',
     blurb: 'Long parallel strokes that bend over the form, like an old banknote.',
-    build: buildEngrave, presets: ENGRAVE_PRESETS, minSheetRatio: 360, tone: {}, shape: 'square',
+    build: buildEngrave, presets: ENGRAVE_PRESETS, minSheetRatio: 360, maxSheetRatio: 2400, tone: {}, shape: 'square',
     fieldRings: o => {
       const bands = Math.round(1.97 / (engraveLevels(o) * tCU(o.toolMm, o.sheetMm)));
       return Math.max(8, Math.round(bands / 2));
@@ -116,12 +126,13 @@ export function autoSheet(styleId, toolMm) {
 }
 
 /**
- * How well a sheet suits the tool: ok = a face will read; tooSmall = honest warning; tooBig = the
- * drawing would take days (and more line than the geometry holds), so the UI offers it disabled.
+ * How well a sheet suits the tool: ok = a face will read; tooSmall = honest warning; tooBig = more
+ * line than one drawing holds at full detail (the style's measured maxSheetRatio), so the UI offers
+ * it disabled. A drawing is never cut short either way: past the budget the builders lower detail.
  */
 export function sheetFit(styleId, toolMm, sheetMm) {
-  const ratio = sheetMm / toolMm, min = realStyleById(styleId).minSheetRatio;
-  return { ratio, min, ok: ratio >= min * 0.97, tooSmall: ratio < min * 0.97, tooBig: ratio > Math.max(1300, min * 4) };
+  const st = realStyleById(styleId), ratio = sheetMm / toolMm, min = st.minSheetRatio;
+  return { ratio, min, ok: ratio >= min * 0.97, tooSmall: ratio < min * 0.97, tooBig: ratio > (st.maxSheetRatio || Math.max(1300, min * 4)) };
 }
 
 /**
@@ -157,6 +168,9 @@ export function buildReal(styleId, field, opts = {}) {
   const style = realStyleById(styleId);
   const o = realOptions(style.id, opts);
   const geom = style.build(field, o);
+  // every builder fits its whole line into the budget (sampling coarser, then lowering detail and
+  // saying so in real.reduced): a drawing cut short would be a lie about the photo and the clock
+  if (geom.n > MAX_POINTS || (geom.real || geom.stats || {}).truncated) throw new Error(`${style.id}: line over the point budget`);
   if (!opts.exact) handWarp(geom, o);
   const mmPerCU = LAYOUT_R * o.sheetMm;
   const src = geom.real || geom.stats || {};

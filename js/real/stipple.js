@@ -88,6 +88,24 @@ function bucket(X, Y, n, cell) {
  * Stipples whose local spacing is r(x) = K t / c(x). Error diffusion on a grid finer than the
  * tool width gives the right count per patch with blue-noise character; repulsion then evens them.
  */
+/** How many stipples stipples() will place, before placing them: the dither lays down the sum of
+ * its per-cell probabilities, so a coarse grid of the same sum is within a few per cent. */
+function stippleCount(field, P) {
+  const { t, cap, gamma, rMax } = P;
+  const tauFloor = K * t / rMax, tauMax = 1 / R_MIN_T;
+  const lim = 1 - t * 0.75, g = t * 0.7, nx = Math.floor(2 * lim / g);
+  const m = Math.min(nx, 256), c = 2 * lim / m;
+  let s = 0;
+  for (let j = 0; j < m; j++) {
+    for (let i = 0; i < m; i++) {
+      const D = Math.max(0, Math.min(1, sampleField(field, -lim + (i + 0.5) * c, -lim + (j + 0.5) * c)));
+      const r = K * t / Math.min(tauMax, Math.max(tauFloor, TAU(cap * Math.pow(D, gamma))));
+      s += Math.min(1, RHO * g * g / (r * r));
+    }
+  }
+  return s * nx * nx / (m * m);
+}
+
 function stipples(field, P) {
   const { t, cap, gamma, rMax, relax, seed } = P;
   const rand = mulberry32(seed * 7919 + 23);
@@ -478,12 +496,25 @@ export function build(field, opts = {}) {
   const rMax = Math.max(3 * t, Math.min(preset.floorT * t, 0.35));
   const P = { t, cap: preset.cap, gamma: O.gamma, rMax, relax: preset.relax, seed: O.seed | 0 || 1 };
 
-  let S = stipples(field, P);
   // A sheet that is dark all over with a very fine pen would need more line than the geometry can
   // hold (MAX_POINTS, ~3.5 points per stipple at the least). Spread the stipples evenly instead:
-  // lighter overall, still monotonic; the pen keeps its real width.
+  // lighter overall, still monotonic; the pen keeps its real width. The count is estimated first,
+  // so an over-budget drawing places its dots once instead of twice.
   const maxStipples = Math.floor(MAX_POINTS / 3.5);
-  if (S.n > maxStipples) S = stipples(field, { ...P, t: t * Math.sqrt(S.n / maxStipples) * 1.03 });
+  const want = stippleCount(field, P);
+  let tFit = t, reduced = null;
+  if (want > maxStipples) {
+    tFit = t * Math.sqrt(want / maxStipples) * 1.03;
+    reduced = { from: Math.round(want), to: 0, unit: 'stipples', reason: 'points' };
+  }
+  let S = stipples(field, tFit === t ? P : { ...P, t: tFit });
+  if (reduced) reduced.to = S.n;
+  for (let tries = 0; S.n > maxStipples && tries < 6; tries++) {
+    const from = reduced ? reduced.from : S.n;
+    tFit *= Math.sqrt(S.n / maxStipples) * 1.03;
+    S = stipples(field, { ...P, t: tFit });
+    reduced = { from, to: S.n, unit: 'stipples', reason: 'points' };
+  }
   const { px, py } = S;
   let n = S.n;
   const tS = performance.now();
@@ -516,8 +547,8 @@ export function build(field, opts = {}) {
   const touched = new Uint8Array(n);
   // ~7 samples per stipple at full detail; a huge dark sheet (hundreds of thousands of stipples)
   // samples its curves more coarsely rather than ever exceeding MAX_POINTS
-  const fine = Math.min(1, MAX_POINTS * 0.8 / (n * 7.5));
-  const maxStep = Math.min(1.5 * t, 1 / mmPerCU) / fine, angStep = 0.21 / fine;
+  let fine = Math.min(1, MAX_POINTS * 0.8 / (n * 7.5));
+  let maxStep = Math.min(1.5 * t, 1 / mmPerCU) / fine, angStep = 0.21 / fine, fineTries = 0;
   // paper-space drift: neighbouring passes drift together (a smooth, nearly rigid warp of the sheet)
   const wob = [0, 0];
   const lim = 1 - t * 0.5, limS = 1 - t * 0.75;   // limS: where the stipples stop
@@ -539,6 +570,13 @@ export function build(field, opts = {}) {
   for (;;) {
     const tl = performance.now();
     L = roundCorners(px, py, tour, rf, touched, maxStep, angStep);
+    // the estimate above was short: sample the corners coarser still (never cut the line)
+    if (L.m > MAX_POINTS && fineTries < 6) {
+      fineTries++;
+      fine *= MAX_POINTS * 0.95 / L.m;
+      maxStep = Math.min(1.5 * t, 1 / mmPerCU) / fine; angStep = 0.21 / fine;
+      continue;
+    }
     // hand drift, the frame and float32 storage go in BEFORE the check, so what is checked is
     // exactly what gets drawn
     const tw = performance.now();
@@ -563,8 +601,8 @@ export function build(field, opts = {}) {
     for (const sIdx of pairs) for (let v = L.VID[sIdx] - 1; v <= L.VID[sIdx] + 2; v++) if (v >= 0 && v < n) { rf[v] *= f; touched[v] = 1; }
     guard++;
   }
-  let count = L.m;
-  if (count > MAX_POINTS) count = MAX_POINTS;     // cannot happen at real tool sizes; keeps the contract
+  const count = L.m;
+  if (count > MAX_POINTS) throw new Error(`real-stipple: ${count} points exceeds the budget`);
   const data = new Float32Array(count * STRIDE);
   let s = 0, qx = 0, qy = 0;
   for (let i = 0; i < count; i++) {
@@ -618,7 +656,10 @@ export function build(field, opts = {}) {
     style: 'stipple', preset: preset.name, toolMm: O.toolMm, sheetMm: O.sheetMm,
     lengthM: +lengthM.toFixed(2), speedCmS, handMin: +(handS / 60).toFixed(1), strokesPerS: rate, plotterMin: +(plotS / 60).toFixed(1),
     stipples: n, spursSkipped: nAll - n, points: count, crossingsFixed: unx.fixed, crossingsLeft: unx.left, lineCrossings: left, guardRounds: guard,
-    buildMs: Math.round(buildMs),
+    buildMs: Math.round(buildMs), truncated: false, sampling: { fine: +fine.toFixed(3) },
+    ...(reduced ? { reduced } : {}),
+    // the dots a full-detail drawing wants, per the most the line can hold (over 1: dots were spread)
+    load: +((reduced ? reduced.from : S.n) / maxStipples).toFixed(3),
     ms: { stipple: Math.round(tS - t0), knn: Math.round(tK - tS), twoOpt: Math.round(tO - tK), uncross: Math.round(tX - tO), line: Math.round(performance.now() - tX), lineRound: Math.round(split.round), lineWarp: Math.round(split.warp), lineCheck: Math.round(split.check) },
   };
   return geom;

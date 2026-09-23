@@ -88,28 +88,40 @@ function sampleGrid(B, S, x, y) {
  */
 export function build(field, opts = {}) {
   // Over the point budget (a fine pen on a big sheet), the columns get coarser instead of failing:
-  // the same lines at the same spacing, sampled with fewer vertices.
-  let dxK = 1, over = 0;
-  for (let i = 0; i < 4; i++) {
-    const g = buildOnce(field, opts, dxK);
-    if (!g.over) return g;
-    over = g.over;
-    dxK *= g.over / MAX_POINTS * 1.08;
+  // the same lines at the same spacing, sampled with fewer vertices (the lines follow a heavily
+  // blurred relief, so columns half a band apart still draw them smooth). Only past that do the
+  // bands get taller (fewer lines: less detail, said so in real.reduced). Never cut short.
+  let dxK = 1, bandK = 1, K0 = 0;
+  for (let i = 0; i < 12; i++) {
+    const g = buildOnce(field, opts, dxK, bandK);
+    if (!K0) K0 = g.K || g.real.bands;
+    if (!g.over) {
+      if (bandK > 1) g.real.reduced = { from: K0, to: g.real.bands, unit: 'bands', reason: 'points' };
+      g.real.sampling = { dxK: +dxK.toFixed(3) };
+      // the full-detail line at the coarsest columns, per budget (over 1: bands were dropped)
+      g.real.load = +Math.max(bandK > 1 ? 1.01 : 0, g.n / MAX_POINTS * (K0 / g.real.bands) * Math.min(dxK, g.real.dxKMax) / g.real.dxKMax).toFixed(3);
+      return g;
+    }
+    const want = dxK * g.over / MAX_POINTS * 1.06;
+    if (want <= g.dxKMax) dxK = want;
+    else { bandK *= Math.max(1.05, want / Math.max(dxK, g.dxKMax)); dxK = Math.min(want, g.dxKMax); }
   }
-  throw new Error(`real-engrave: ${over} points exceeds the budget`);
+  throw new Error('real-engrave: could not fit the point budget');
 }
 
-function buildOnce(field, opts, dxK) {
+function buildOnce(field, opts, dxK, bandK = 1) {
   const t0 = performance.now();
   const o = { ...ENGRAVE_DEFAULTS, ...opts };
   const mmPerCu = o.layoutR * o.sheetMm;
   const w = o.toolMm / mmPerCu;                       // constant stroke width, circle units
   const M = Math.max(1, Math.round(o.levels));
   const lo = -1 + o.margin, hi = 1 - o.margin;
-  const K = Math.max(2, Math.round((hi - lo) / (M * w)));   // bands top to bottom
+  const K = Math.max(2, Math.round((hi - lo) / (M * w * bandK)));   // bands top to bottom
   const H = (hi - lo) / K;                            // nominal band height (phi units ~ circle units)
   // columns: fine enough that the 4096 px export shows smooth curves, coarse enough for the budget
-  const dx = Math.min(H / 6, 0.006, Math.max(w * 0.9, 0.0025)) * dxK;
+  const dx0 = Math.min(H / 6, 0.006, Math.max(w * 0.9, 0.0025));
+  const dxKMax = Math.max(1, H * 0.5 / dx0);
+  const dx = dx0 * Math.min(dxK, dxKMax);
   const xl = lo + H * 0.55, xr = hi - H * 0.55;       // room for the margin half-turns
   const C = Math.max(4, Math.round((xr - xl) / dx) + 1);
   const dxc = (xr - xl) / (C - 1);
@@ -312,7 +324,7 @@ function buildOnce(field, opts, dxK) {
   }
 
   // ---- 4. geometry: constant width and constant pressure
-  if (np > MAX_POINTS) return { over: np };
+  if (np > MAX_POINTS) return { over: np, dxKMax, K };
   const data = new Float32Array(np * STRIDE);
   let s = 0;
   for (let i = 0; i < np; i++) {
@@ -336,7 +348,7 @@ function buildOnce(field, opts, dxK) {
     real: {
       toolMm: o.toolMm, sheetMm: o.sheetMm, bands: K, levels: M, columns: C,
       lengthM: lengthMm / 1000, handMin: handSec / 60, speedMm: o.speedMm, reversals,
-      points: np, buildMs,
+      points: np, buildMs, dxKMax,
     },
   });
 }

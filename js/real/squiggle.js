@@ -154,16 +154,104 @@ function inverseTable(S, N = 1024) {
   return { inv, lo, hi, N };
 }
 
+// The point budget. A drawing is never cut short: over it, the wiggles are first sampled more
+// coarsely where they are straight (the flanks; crests keep their chords), then with fewer chords
+// per wiggle, and only then does the spiral get fewer rings (less detail, said so in real.reduced).
+const PER_WAVE = 12;                         // chords per wiggle: crests stay round at 4K
+const PER_WAVE_MIN = 7;
+const BUDGET = Math.floor(MAX_POINTS * 0.92);  // the estimate's target; the build's hard cap is MAX_POINTS
+
+// Mean chords per wiggle, relative to perWave, when flanks are sampled (1 + g|cos ph|) coarser
+// than the crests: g = 2u, so dark triangle waves (straight flanks) save the most.
+const FLANK = (() => {
+  const T = new Float32Array(17);
+  for (let j = 0; j <= 16; j++) {
+    const g = 2 * j / 16;
+    let a = 0;
+    for (let i = 0; i < 256; i++) a += 1 / (1 + g * Math.abs(Math.cos((i + 0.5) / 256 * Math.PI)));
+    T[j] = a / 256;
+  }
+  return T;
+})();
+const flankMean = u => FLANK[Math.max(0, Math.min(16, Math.round(u * 16)))];
+
+// Darkness under the pen -> position on the wiggle schedule (u) at spiral angle theta.
+function scheduleAt(S, table, field, o, theta, theta0, b, fade, dirSign) {
+  const r = b * theta;
+  let D = Math.max(0, Math.min(1, sampleField(field, r * Math.cos(theta), r * Math.sin(theta) * dirSign)));
+  if (fade > 0) D *= 1 - smoothstep(1 - fade, 1, r);
+  const ramp = smoothstep(theta0 + Math.PI, theta0 + Math.PI * 5, theta);
+  const cTarget = S.cMin + (1 - S.cMin) * Math.pow(D, o.toneGamma) * ramp;
+  const k = Math.max(0, Math.min(1, (cTarget - table.lo) / Math.max(1e-9, table.hi - table.lo))) * table.N;
+  const ki = Math.min(table.N - 1, k | 0);
+  return { u: table.inv[ki] + (table.inv[ki + 1] - table.inv[ki]) * (k - ki), ramp, r };
+}
+
+/** Points the build will lay with these settings (the same walk without the hand's noise). */
+function estimatePoints(field, S, table, perWave, adapt) {
+  const { o, d } = S;
+  const b = d / (2 * Math.PI), theta0 = Math.PI, thetaEnd = 1 / b;
+  const dirSign = o.direction === 'ccw' ? -1 : 1, fade = Math.max(0, o.edgeFade) * d;
+  const baseStep = Math.min(d / 3, 2 / field.G * 0.9);
+  let pts = 0;
+  for (let theta = theta0; theta < thetaEnd;) {
+    const { u, r } = scheduleAt(S, table, field, o, theta, theta0, b, fade, dirSign);
+    const sch = schedule(S, u), vel = Math.sqrt(r * r + b * b);
+    const perW = perWave * (adapt ? flankMean(u) : 1);
+    const step = sch.A > 1e-9 ? Math.min(baseStep, sch.lam / perW) : baseStep;
+    const dTh = Math.min(step / vel, 0.12);
+    const h = Math.min(thetaEnd - theta, Math.max(dTh, 0.5 * d / vel));
+    pts += h / dTh;
+    theta += h;
+  }
+  return Math.ceil(pts) + 1;
+}
+
 /**
- * Build the squiggle spiral.
+ * Build the squiggle spiral: always the whole spiral, within MAX_POINTS.
  * @param field  darkness field (tone.buildField); build it with `rings: squiggleScale(opts).rings`
  * @param opts   SQUIGGLE_DEFAULTS-shaped
  */
 export function build(field, opts = {}) {
   const t0 = performance.now();
-  const S = squiggleScale(opts);
+  const S0 = squiggleScale(opts);
+  let S = S0, table = inverseTable(S), perWave = PER_WAVE, adapt = false;
+  let est = estimatePoints(field, S, table, perWave, adapt);
+  if (est > BUDGET) {
+    adapt = true;
+    est = estimatePoints(field, S, table, perWave, adapt);
+  }
+  for (let tries = 0; tries < 12; tries++) {
+    if (est > BUDGET && perWave > PER_WAVE_MIN) {
+      perWave = Math.max(PER_WAVE_MIN, Math.floor(perWave * BUDGET / est));
+      est = estimatePoints(field, S, table, perWave, adapt);
+    }
+    if (est > BUDGET && S.rings > S0.o.minRings) {
+      // points grow with rings squared (more rings, and shorter wiggles on each)
+      const target = Math.max(S0.o.minRings, Math.min(S.rings - 1, Math.floor(S.rings / (Math.sqrt(est / BUDGET) * 1.02))));
+      S = squiggleScale({ ...opts, ringFactor: 1 / (target * (S0.o.toolMm / S0.mmPerCU)) });
+      table = inverseTable(S);
+      est = estimatePoints(field, S, table, perWave, adapt);
+      continue;
+    }
+    const g = buildOnce(field, S, table, perWave, adapt, t0);
+    if (g) {
+      if (S.rings !== S0.rings) g.real.reduced = { from: S0.rings, to: S.rings, unit: 'rings', reason: 'points' };
+      g.real.sampling = { perWave, adapt, estimate: est };
+      // the whole line at full detail, sampled as coarsely as the budget allows, per budget (over 1
+      // on this photo, tool and sheet: rings were dropped; the app scales it to other sheets)
+      g.real.load = +(estimatePoints(field, S0, S === S0 ? table : inverseTable(S0), PER_WAVE_MIN, true) / BUDGET).toFixed(3);
+      return g;
+    }
+    // the hand's noise put the line over the cap after all: sample coarser, then drop rings
+    if (perWave > PER_WAVE_MIN) perWave--;
+    else est = Math.ceil(BUDGET * 1.1);
+  }
+  throw new Error('real-squiggle: could not fit the point budget');
+}
+
+function buildOnce(field, S, table, perWave, adapt, t0) {
   const { o, t, d, rings } = S;
-  const table = inverseTable(S);
   const b = d / (2 * Math.PI);
   const theta0 = Math.PI;                    // start half a ring out
   const thetaEnd = 1 / b;
@@ -173,7 +261,6 @@ export function build(field, opts = {}) {
   const fade = Math.max(0, o.edgeFade) * d;
   const fieldPx = 2 / field.G;
   const baseStep = Math.min(d / 3, fieldPx * 0.9);
-  const PER_WAVE = 12;                       // chords per wiggle: crests stay round at 4K
   const speed = o.speedMm / S.mmPerCU;       // circle units per second
   const drift = [0, 0];
   const aCap = S.aMax;
@@ -223,7 +310,7 @@ export function build(field, opts = {}) {
     const dtFree = ds / speed, dt = Math.max(dtFree, dPhase / (2 * Math.PI * o.wiggleHz));
     handT += dt;
     cycles += dPhase / (2 * Math.PI);
-    if (n >= MAX_POINTS) break;
+    if (n >= MAX_POINTS) return null;       // never cut short: the caller samples coarser
     if (n >= cap) {
       cap = Math.ceil(cap * 1.7);
       const grown = new Float32Array(cap * STRIDE); grown.set(data); data = grown;
@@ -243,7 +330,9 @@ export function build(field, opts = {}) {
     if (last) break;
 
     prevTheta = theta;
-    const step = A > 1e-9 ? Math.min(baseStep, lam / PER_WAVE) : baseStep;
+    // over budget, the straight flanks of a wiggle take longer chords than its round crests
+    const flank = adapt ? 1 + 2 * u * Math.abs(Math.cos(phase)) : 1;
+    const step = A > 1e-9 ? Math.min(baseStep, lam / perWave * flank) : baseStep;
     theta += Math.min(step / vel, 0.12);
   }
   const buildMs = performance.now() - t0;
@@ -260,7 +349,7 @@ export function build(field, opts = {}) {
     rings, spacingMm: +(d * S.mmPerCU).toFixed(3), lightestCoverage: +S.cMin.toFixed(3), darkestCoverage: +table.hi.toFixed(3),
     lengthM: +(lengthMm / 1000).toFixed(2), wiggles: Math.round(cycles),
     handSeconds: Math.round(handT), speedMm: o.speedMm, wiggleHz: o.wiggleHz,
-    points: n, buildMs: +buildMs.toFixed(1), truncated: n >= MAX_POINTS,
+    points: n, buildMs: +buildMs.toFixed(1), truncated: false,
   };
   return geom;
 }

@@ -106,6 +106,12 @@ area is to draw more line there. That is exactly what a person with a pen would 
   sheet big enough, up to 2 m across. You can also pick one yourself.
 - **Honest numbers**: metres of line and hours by hand for every drawing, plus Window, Raking and
   Overhead light.
+- **Never cut short.** A fine pen on a big sheet can need more line than one drawing holds
+  (1.4 million points). The line is then drawn with fewer points where it runs straight. If that
+  is still not enough, the drawing gets less detail (fewer rings, dots or bands, bigger loops, or
+  a Masterpiece drawn as Detailed), and the app tells you. How much line a sheet needs depends on
+  the photo: a very dark one can lower detail even on a sheet the tool is offered, and the sheet
+  list marks those sizes ("less detail with this photo"). The whole photo is always drawn.
 - **The SVG is a real plotter file**: one path, the sheet's real size in millimetres, and the
   stroke as wide as the pen.
 

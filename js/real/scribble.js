@@ -256,23 +256,20 @@ function hairpin(ax, ay, bx, by, cx, cy, lab) {
 }
 
 // ------------------------------------------------------------------------------ build
-/**
- * @param field  darkness field (tone.buildField); D = 1 means the darkest ink
- * @param opts   SCRIBBLE_DEFAULTS-shaped, plus any preset key overridden (cmax, gamma, loopScale)
- */
-export function build(field, opts = {}) {
-  const t0 = (typeof performance !== 'undefined' ? performance : Date).now();
-  const o = { ...SCRIBBLE_DEFAULTS, ...opts };
-  const P = { ...(SCRIBBLE_PRESETS[o.preset] || SCRIBBLE_PRESETS.detailed) };
-  for (const k of ['cmax', 'gamma', 'loopScale']) if (opts[k] != null) P[k] = opts[k];
-  const F = o.sheetMm * o.layoutR;                  // mm per circle unit (half the art square)
-  const seed = (o.seed | 0) || 1;
-  const rand = mulberry32(seed * 7919 + 101);
-  const tab = toneTable(o, P);
+// Sampling levels, finest first: [chords per loop, longest chord on a travelling stroke (mm)].
+// Over the point budget the loops are drawn with fewer chords before any detail is given up. A
+// pen's loops are tiny (a 0.4 mm pen's darkest are ~0.5 mm across, 5 px at the 4K export on A2),
+// so 8 chords still round them to within half a pixel.
+const FIDELITY = [[18, 0.4], [15, 0.5], [13, 0.65], [11, 0.8], [10, 1], [9, 1.2], [8, 1.5]];
+const GUIDE_CAP = 400000;
+const BUDGET = MAX_POINTS - 1;
+
+/** The darkness under the pen, in mm on the frame [-F, F]^2, with the soft vignette. */
+function darkness(field, o, F, seed) {
   // a soft, uneven vignette: the shading thins out toward the frame the way a hand stops short
   // of it, instead of a ruled edge
   const vig = Math.max(0, o.vignette) * F;
-  const D = vig > 0
+  return vig > 0
     ? (x, y) => {
       const e = F - Math.max(Math.abs(x), Math.abs(y));
       const a = Math.atan2(y, x) * 7;
@@ -281,22 +278,151 @@ export function build(field, opts = {}) {
       return sampleField(field, x / F, y / F) * f * f * (3 - 2 * f);
     }
     : (x, y) => sampleField(field, x / F, y / F);
+}
+
+// The drawing's size before any of it is laid, from the darkness alone: blue noise of spacing h
+// holds ~GUIDE_RHO / h^2 guide points per mm^2, its tour lays KAPPA / h mm of guide per mm^2, and
+// each mm of guide takes the same steps as the walk (stepsOf). EST_K is the walk's measured excess
+// (hairpins, the darkest of three samples per segment).
+const GUIDE_RHO = 0.72;
+const EST_K = 1.2;
+function darkGrid(D, F, n = 128) {
+  const g = new Float32Array(n * n), c = 2 * F / n;
+  for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) g[j * n + i] = D(-F + (i + 0.5) * c, -F + (j + 0.5) * c);
+  return { g, A: c * c };
+}
+function estimate(grid, tab, [spl, dsm]) {
+  let guide = 0, pts = 0;
+  for (let k = 0; k < grid.g.length; k++) {
+    const Dk = grid.g[k], h = lookup(tab.h, tab.N, Dk);
+    if (!Number.isFinite(h)) continue;
+    const R = lookup(tab.R, tab.N, Dk), m = lookup(tab.m, tab.N, Dk);
+    const rate = Math.sqrt(Math.max(0, m * m - 1)) / Math.max(0.2, R * 0.6) * 1.3;
+    guide += grid.A * GUIDE_RHO / (h * h);
+    pts += grid.A * KAPPA / h * Math.max(1 / dsm, rate * spl / (Math.PI * 2));
+  }
+  return { guide, pts: pts * EST_K };
+}
+
+const PRESET_ORDER = ['quick', 'detailed', 'masterpiece'];   // coarse to fine
+
+/**
+ * Always the whole drawing, within MAX_POINTS. The line a tone needs is set by the tool (see the
+ * tone model), so over the budget the loops first get fewer chords, then grow bigger: the same
+ * line length in fewer, larger loops (less detail, said so in stats.reduced). The loop size is
+ * picked from an estimate before the guide and its tour are built, so the build runs once (a
+ * second time only when the exact count disagrees). A finer preset never ends coarser than the
+ * next coarser one: when its fitted loops would be bigger than that preset's, it is drawn as that
+ * preset (stats.reduced.asPreset).
+ * @param field  darkness field (tone.buildField); D = 1 means the darkest ink
+ * @param opts   SCRIBBLE_DEFAULTS-shaped, plus any preset key overridden (cmax, gamma, loopScale)
+ */
+export function build(field, opts = {}) {
+  const t0 = (typeof performance !== 'undefined' ? performance : Date).now();
+  const want = SCRIBBLE_PRESETS[opts.preset] ? opts.preset : 'detailed';
+  const own = ['cmax', 'gamma', 'loopScale'].some(k => opts[k] != null);
+  const o = { ...SCRIBBLE_DEFAULTS, ...opts };
+  const F = o.sheetMm * o.layoutR;
+  const grid = darkGrid(darkness(field, o, F, (o.seed | 0) || 1), F);
+  const coarsest = FIDELITY[FIDELITY.length - 1];
+  // how far over the budget a preset's line is at loop scale ls (points go as 1 / loop size,
+  // guide points as 1 / loop size squared)
+  const overAt = (preset, ls) => {
+    const P = { ...SCRIBBLE_PRESETS[preset], loopScale: ls };
+    for (const k of ['cmax', 'gamma']) if (opts[k] != null) P[k] = opts[k];
+    const e = estimate(grid, toneTable(o, P), coarsest);
+    return Math.max(e.pts / BUDGET, Math.sqrt(e.guide / (GUIDE_CAP * 0.9)));
+  };
+  const fit = (preset, ls) => {
+    for (let i = 0; i < 8; i++) {
+      const over = overAt(preset, ls);
+      if (over <= 1) break;
+      ls *= over * 1.02;
+    }
+    return ls;
+  };
+  const ls0 = opts.loopScale != null ? opts.loopScale : SCRIBBLE_PRESETS[want].loopScale;
+  const load = overAt(want, ls0);
+  let preset = want, ls = load > 1 ? fit(want, ls0) : ls0;
+  // over the budget, a finer preset falls back to a coarser one before its loops outgrow that one's
+  for (let idx = PRESET_ORDER.indexOf(preset); !own && ls > ls0 && idx > 0; idx--) {
+    const q = PRESET_ORDER[idx - 1], lsQ = SCRIBBLE_PRESETS[q].loopScale;
+    if (ls <= lsQ) break;
+    preset = q;
+    ls = fit(q, lsQ);
+  }
+  for (let tries = 0; tries < 10; tries++) {
+    const r = buildOnce(field, { ...opts, preset, loopScale: ls }, t0);
+    if (r.geom) {
+      const st = r.geom.stats;
+      st.preset = want;
+      st.load = +load.toFixed(3);
+      const Pf = { ...SCRIBBLE_PRESETS[preset], loopScale: ls };
+      for (const k of ['cmax', 'gamma']) if (opts[k] != null) Pf[k] = opts[k];
+      st.estimate = Math.round(estimate(grid, toneTable(o, Pf), [st.sampling.segPerLoop, st.sampling.dsMax]).pts);
+      if (ls !== ls0 || preset !== want) {
+        st.reduced = { from: +ls0.toFixed(3), to: +ls.toFixed(3), unit: 'loop size', reason: 'points' };
+        if (preset !== want) st.reduced.asPreset = SCRIBBLE_PRESETS[preset].label;
+      }
+      return r.geom;
+    }
+    ls *= Math.max(1.03, r.grow);
+    // the exact count may push a finer preset's loops past the coarser one's after all
+    const idx = PRESET_ORDER.indexOf(preset), q = PRESET_ORDER[idx - 1];
+    if (!own && q && ls > SCRIBBLE_PRESETS[q].loopScale) { preset = q; ls = fit(q, SCRIBBLE_PRESETS[q].loopScale); }
+  }
+  throw new Error('real-scribble: could not fit the point budget');
+}
+
+function buildOnce(field, opts, t0) {
+  const o = { ...SCRIBBLE_DEFAULTS, ...opts };
+  const P = { ...(SCRIBBLE_PRESETS[o.preset] || SCRIBBLE_PRESETS.detailed) };
+  for (const k of ['cmax', 'gamma', 'loopScale']) if (opts[k] != null) P[k] = opts[k];
+  const F = o.sheetMm * o.layoutR;                  // mm per circle unit (half the art square)
+  const seed = (o.seed | 0) || 1;
+  const rand = mulberry32(seed * 7919 + 101);
+  const tab = toneTable(o, P);
+  const D = darkness(field, o, F, seed);
 
   const G = guidePoints(D, F, tab, rand);
+  // the guide stopped at its cap: part of the sheet would get no loops. Bigger loops, fewer points.
+  if (G.n >= GUIDE_CAP) return { grow: 1.3 };
   if (G.n < 2) { G.xs.push(0, 1); G.ys.push(0, 0); G.n = G.xs.length; }
   const T = tour(G, F);
   const tTour = (typeof performance !== 'undefined' ? performance : Date).now();
 
-  // output buffer
-  let cap = Math.min(MAX_POINTS, 200000);
+  // Count the points before laying any (exact: the same step rule as the walk below), and pick
+  // the finest sampling that fits the budget.
+  const TAU = Math.PI * 2;
+  const segRate = new Float32Array(Math.max(1, T.n - 1));
+  for (let i = 0; i < T.n - 1; i++) {
+    const x1 = T.X[i], y1 = T.Y[i], x2 = T.X[i + 1], y2 = T.Y[i + 1];
+    const Dm = Math.max(D(x1, y1), D((x1 + x2) / 2, (y1 + y2) / 2), D(x2, y2));
+    const Rm = lookup(tab.R, tab.N, Dm), mm = lookup(tab.m, tab.N, Dm);
+    segRate[i] = Math.sqrt(Math.max(0, mm * mm - 1)) / Math.max(0.2, Rm * 0.6) * 1.3;
+  }
+  const stepsOf = (i, chord, spl, dsm) => Math.max(1, Math.ceil(chord / dsm), Math.ceil(chord * segRate[i] / (TAU / spl)));
+  const countAt = ([spl, dsm]) => {
+    let c = 1;
+    for (let i = 0; i < T.n - 1; i++) {
+      const chord = Math.hypot(T.X[i + 1] - T.X[i], T.Y[i + 1] - T.Y[i]);
+      if (chord >= 1e-6) c += stepsOf(i, chord, spl, dsm);
+    }
+    return c;
+  };
+  let fid = FIDELITY[0], need = countAt(fid);
+  for (let f = 1; need > BUDGET && f < FIDELITY.length; f++) { fid = FIDELITY[f]; need = countAt(fid); }
+  // still over at the coarsest sampling: loops scale up (points go as 1 / loop size)
+  if (need > BUDGET) return { grow: need / BUDGET * 1.02 };
+  const [segPerLoop, dsMax] = fid;
+
+  // output buffer, sized from the count
+  let cap = Math.min(MAX_POINTS, need + 16);
   let data = new Float32Array(cap * STRIDE);
   let n = 0;
   const wU = o.toolMm / F;
   let sMm = 0, phi = rand() * 6.283, sGuide = 0, handS = 0, loops = 0;
   let px = 0, py = 0;
-  const TAU = Math.PI * 2;
-  const segPerLoop = 18;
-  const dsMax = 0.4;                               // mm: smooth curves at any tool size
   let over = false;
 
   const emit = (x, y, loopy) => {
@@ -341,10 +467,7 @@ export function build(field, opts = {}) {
     if (prevPin) { m1x = prevPin[0] * chord / prevPin[2]; m1y = prevPin[1] * chord / prevPin[2]; }
     prevPin = pin ? [pin[0], pin[1], chord] : null;
     // how finely to walk this segment: enough samples per loop at its darkest point
-    const Dm = Math.max(D(x1, y1), D((x1 + x2) / 2, (y1 + y2) / 2), D(x2, y2));
-    const Rm = lookup(tab.R, tab.N, Dm), mm = lookup(tab.m, tab.N, Dm);
-    const rateMax = Math.sqrt(Math.max(0, mm * mm - 1)) / Math.max(0.2, Rm * 0.6) * 1.3;
-    const steps = Math.max(1, Math.ceil(chord / dsMax), Math.ceil(chord * rateMax / (TAU / segPerLoop)));
+    const steps = stepsOf(i, chord, segPerLoop, dsMax);
     for (let k = 1; k <= steps; k++) {
       const t = k / steps, t2 = t * t, t3 = t2 * t;
       const h00 = 2 * t3 - 3 * t2 + 1, h10 = t3 - 2 * t2 + t, h01 = -2 * t3 + 3 * t2, h11 = t3 - t2;
@@ -381,6 +504,7 @@ export function build(field, opts = {}) {
       emit(x, y, loopy);
     }
   }
+  if (over) return { grow: 1.1 };                 // cannot happen (the count is exact); never cut short
   loops = phi / TAU;
   const t1 = (typeof performance !== 'undefined' ? performance : Date).now();
   const geom = finishGeometry({
@@ -393,10 +517,10 @@ export function build(field, opts = {}) {
   geom.stats = {
     toolMm: o.toolMm, sheetMm: o.sheetMm, preset: o.preset,
     lengthM: sMm / 1000, handSeconds: handS, points: n, guidePoints: G.n, loops: Math.round(loops),
-    buildMs: t1 - t0, tourMs: tTour - t0, truncated: over,
+    buildMs: t1 - t0, tourMs: tTour - t0, truncated: false, sampling: { segPerLoop, dsMax },
     loopRadiusMm: [tab.Rdark, tab.Rlight],
   };
-  return geom;
+  return { geom };
 }
 
 /** "1 h 23 min" style drawing time. */

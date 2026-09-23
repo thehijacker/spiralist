@@ -1169,16 +1169,32 @@ function buildRealSizes() {
 const sheetSel = $('realSheet');
 // The drawing is square: an 'A4' sheet is the 21 x 21 cm square on A4 paper, and says so
 const sheetName = mm => { const s = SHEETS.find(x => x.mm === mm); return s && /^A\d$/.test(s.name) ? `${formatSheet(mm)} (on ${s.name})` : formatSheet(mm); };
+// How much of one drawing's line this photo needs at full detail on each sheet, from the last build
+// in this style, tool and preset (real.load, the builder's own estimate at its sheet): the line
+// grows with the sheet's area in tool widths, so a sheet over 1 will have its detail lowered.
+function photoLoad(mm) {
+  const g = geom?.real, r = doc.real;
+  if (!g || !(g.load > 0) || g.style !== r.style || g.toolMm !== r.toolMm || g.preset !== r.preset) return null;
+  return g.load * (mm / g.sheetMm) ** 2;
+}
+let sheetOptKey = '';
 function buildSheetOptions() {
   const r = doc.real;
   const auto = autoSheet(r.style, r.toolMm);
+  const labels = SHEETS.map(s => {
+    const fit = sheetFit(r.style, r.toolMm, s.mm), load = photoLoad(s.mm);
+    return `${sheetName(s.mm)}${fit.tooSmall ? ' · too small for this tool' : fit.tooBig ? ' · tool too fine for this size' : load > 1 ? ' · less detail with this photo' : ''}`;
+  });
+  const key = JSON.stringify([auto, r.style, r.toolMm, r.sheetMm, r.sheetAuto, labels]);
+  if (key === sheetOptKey) return;          // rebuilt only when a label changes (an open list stays open)
+  sheetOptKey = key;
   const opts = [new Option(`Auto · ${sheetName(auto)}`, 'auto')];
-  for (const s of SHEETS) {
+  SHEETS.forEach((s, i) => {
     const fit = sheetFit(r.style, r.toolMm, s.mm);
-    const o = new Option(`${sheetName(s.mm)}${fit.tooSmall ? ' · too small for this tool' : fit.tooBig ? ' · tool too fine for this size' : ''}`, String(s.mm));
+    const o = new Option(labels[i], String(s.mm));
     o.disabled = fit.tooBig && s.mm !== r.sheetMm;
     opts.push(o);
-  }
+  });
   sheetSel.replaceChildren(...opts);
   sheetSel.value = r.sheetAuto ? 'auto' : String(r.sheetMm);
 }
@@ -1195,6 +1211,36 @@ const LIGHT_NAME = { window: 'Window', raking: 'Raking', overhead: 'Overhead' };
 const lightSeg = bindSeg(document.querySelector('[data-bind="realLight"]'), doc.real.light, v =>
   change(d => { d.real.light = v; }, { label: `Light: ${LIGHT_NAME[v]}`, level: 'render' }));
 
+/** What a realistic build gave up to stay one whole drawing (geom.real.reduced), in plain words. */
+function reducedNote(g) {
+  const r = g.reduced;
+  const what = { rings: `${r.to} rings instead of ${r.from}`, stipples: `${r.to.toLocaleString('en')} dots instead of ${r.from.toLocaleString('en')}`,
+    bands: `${r.to} bands instead of ${r.from}`, 'loop size': `loops ${Math.round((r.to / r.from - 1) * 100)} % bigger` }[r.unit] || 'less detail';
+  // a finer preset that cannot be honoured is drawn as the coarser one it would otherwise lose to;
+  // spread dots are capped, so every preset that spreads them gives the same drawing
+  const how = r.asPreset ? `, drawn as ${r.asPreset}` : r.unit === 'stipples' ? '; a finer preset adds nothing at this size' : '';
+  return `Too much line for one drawing at this size with this photo: detail lowered to fit (${what}${how}; the time is for this drawing)`;
+}
+
+/** The sheet card also says it when the finished drawing had to lower its detail. */
+function updateReducedWarn() {
+  const warn = $('sheetWarn'), g = geom?.real, r = doc.real;
+  if (!warn || !realistic()) return;
+  const own = warn.dataset.reduced === '1';
+  const current = g && g.style === r.style && g.toolMm === r.toolMm && g.sheetMm === r.sheetMm && g.preset === r.preset;
+  if (current && g.reduced && (warn.hidden || own)) {
+    warn.replaceChildren();
+    const span = document.createElement('span');
+    span.textContent = `${reducedNote(g)}. The whole photo is still drawn; a smaller sheet or a broader tool keeps every detail.`;
+    warn.append(span);
+    warn.dataset.reduced = '1';
+    warn.hidden = false;
+  } else if (own && !(current && g.reduced)) {
+    warn.hidden = true;
+    delete warn.dataset.reduced;
+  }
+}
+
 /** The honest numbers: metres of line, time by hand, the tool and the sheet. */
 function updateRealInfo() {
   if (!realistic()) { updateScaleCaption(null); return; }
@@ -1207,12 +1253,18 @@ function updateRealInfo() {
     const m = g.lengthM;
     el.innerHTML = `<b>${m >= 10 ? m.toFixed(0) : m.toFixed(1)} m</b> of line · about <b>${formatHand(g.handSeconds)}</b> by hand · `;
     el.append(what);
+    // the drawing is always whole; when it could not hold every detail at this size, say so
+    if (g.reduced) el.append(` · ${reducedNote(g)}`);
+    // a scribble only shades what is dark: on a near-white photo there is nothing to circle
+    else if (g.style === 'scribble' && g.points < 100) el.append(' · Nothing dark enough to scribble: try Squiggle, or raise the contrast');
   } else if (realState.failed && realState.failed === realState.want) {
     el.textContent = `Could not draw this · ${what}`;
   } else {
     el.textContent = `Drawing the line… · ${what}`;
   }
   updateScaleCaption(current ? g : null);
+  updateReducedWarn();
+  if (current) buildSheetOptions();
 }
 
 /**
@@ -1248,6 +1300,7 @@ function syncReal() {
     ? `The smallest sheet on which a ${r.toolMm} mm ${t.name.toLowerCase()} can draw a face in this style.${r.sheetMm > 420 ? ' The line keeps its real width, so a broad tool needs a big sheet.' : ''}`
     : 'The line always keeps its real width: a bigger sheet means more line and more detail.';
   const warn = $('sheetWarn');
+  delete warn.dataset.reduced;
   const snapped = sheetSnap && sheetSnap.to === r.sheetMm && !r.sheetAuto && sheetSnap.tool === r.tool && sheetSnap.toolMm === r.toolMm;
   warn.hidden = !fit.tooSmall && !snapped;
   if (snapped && !fit.tooSmall) {

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { cameraBasis, project, unproject as unprojectDesk, planeTransform, planCamera, planPace, shotIntent, lens, SHOT, MACRO, deskBakeSize } from '../js/scene.js';
 import { DESKS, deskById, DESK_GLSL } from '../js/desks.js';
-import { sheetPlace, FORMATS, drawSeconds, signSeconds } from '../js/film.js';
+import { sheetPlace, FORMATS, drawSeconds, signSeconds, planHandPace, realInfo, formatHand, formatSpeed } from '../js/film.js';
 import { cleanSignature, timeSignature, placeSignature, SIGNATURE_MAX } from '../js/signature.js';
 
 let failures = 0;
@@ -358,6 +358,74 @@ test('signature: text clean-up, timing, placement clear of the art', () => {
   const long = { ...tr, width: 13 };
   const pl = placeSignature(long, { x: 0, y: 0, r: 0.42, square: false });
   assert.ok(pl.em * 13 <= 0.52 + 1e-9 && pl.x >= -0.5, `long name: ${JSON.stringify(pl)}`);
+});
+
+// ---------------------------------------------------------------------------------- realistic film
+test('realistic pace: 1x opening, one smooth ramp, 1x last stroke, hand time adds up exactly', () => {
+  for (const [total, D] of [[3 * 3600 + 12 * 60, 27.4], [1304, 27.4], [3486, 57.4], [40, 7.4]]) {
+    const t0 = 0.4, t1 = t0 + D;
+    const P = planHandPace({ t0, t1, total });
+    assert.ok(Math.abs(P.hand(t1) - total) < 1e-6 * total, `sums to ${P.hand(t1)} not ${total}`);
+    assert.equal(P.at(t0), 0);
+    assert.equal(P.at(t1 + 1), 1);
+    // real speed through the opening (after the first touch) and on the last stroke
+    const mid = t0 + 0.5 * P.open, last = t1 - 0.5 * P.last;
+    assert.ok(Math.abs(P.speed(mid) - 1) < 0.02, `opening at ${P.speed(mid)}x`);
+    assert.ok(Math.abs(P.speed(last) - 1) < 0.02, `last stroke at ${P.speed(last)}x`);
+    // monotone hand clock, speed never above the peak, and no jerk: log speed changes smoothly
+    let prev = -1, maxJump = 0, lp = null;
+    for (let t = t0; t <= t1; t += 1 / 120) {
+      const h = P.hand(t);
+      assert.ok(h >= prev - 1e-9, 'hand clock runs backwards');
+      prev = h;
+      const s = P.speed(t);
+      assert.ok(s <= P.peak * 1.0001, `speed ${s} above peak ${P.peak}`);
+      if (t > t0 + 0.25) { const l = Math.log(s); if (lp != null) maxJump = Math.max(maxJump, Math.abs(l - lp)); lp = l; }
+    }
+    // at 120 Hz the speed never changes by more than ~6% between samples (a continuous ramp)
+    if (total > D * 2) assert.ok(maxJump < 0.06, `speed jumps by ${Math.exp(maxJump)}x in one step (total ${total})`);
+    assert.ok(P.peak >= P.avg, 'peak below the average');
+  }
+});
+
+test('realistic hand clock: realInfo derives handT when missing and film counters read like people talk', () => {
+  // a straight line along x in circle units, 0.001 cu per point, dwell 2 on the second half
+  const n = 1001, data = new Float32Array(n * 7);
+  for (let i = 0; i < n; i++) { data[i * 7] = i * 0.001; data[i * 7 + 6] = i > 500 ? 2 : 1; }
+  const g = { n, data, path: 'real-stipple', layout: { r: 0.42 }, real: { style: 'stipple', sheetMm: 800, toolMm: 4, handMin: 3 } };
+  const R = realInfo(g);
+  assert.equal(R.sheetMm, 800); assert.equal(R.toolMm, 4);
+  assert.ok(Math.abs(R.handT[n - 1] - 180) < 1e-6 && Math.abs(R.handSeconds - 180) < 1e-9);
+  // the slower half takes twice as long
+  assert.ok(Math.abs((R.handT[n - 1] - R.handT[500]) / R.handT[500] - 2) < 0.01);
+  assert.equal(realInfo({ n, data, path: 'spiral' }), null);
+  assert.equal(formatHand(59.4), '59 s');
+  assert.equal(formatHand(3 * 3600 + 12 * 60), '3 h 12 min');
+  assert.equal(formatHand(3840), '1 h 04 min');
+  assert.equal(formatHand(125, true), '2 min 05 s');
+  assert.equal(formatSpeed(1), '1×');
+  assert.equal(formatSpeed(4.4), '4.5×');
+  assert.equal(formatSpeed(237), '240×');
+  assert.equal(formatSpeed(1234), '1200×');
+});
+
+test('realistic shots: sizes in mm override the defaults; a big sheet keeps the real aperture', () => {
+  const frame = { W: 1080, H: 1080, side: 820, cx: 540, cy: 540 };
+  const base = { t0: 0.4, t1: 27.8, art: { x: 0, y: 0, r: 0.42 }, frame, safe: [0.1, 0.1, 0.9, 0.9] };
+  const plain = shotIntent({ ...base, mode: 'follow' });
+  const real = shotIntent({ ...base, mode: 'follow', shot: { follow: { close: 3.6, mid: 2.35, hold: 2.6, ease: 3 } } });
+  assert.equal(plain.zclose, SHOT.follow.close);
+  assert.equal(real.zclose, 3.6);
+  assert.equal(real.zmid, 2.35);
+  assert.ok(Math.abs(real.zoomAt(0.4 + 2.5, 0) - 3.6) < 0.2, 'close-up held through the real-speed opening');
+  const cen = shotIntent({ ...base, mode: 'center', shot: { center: { close: 4, pull: 2, pullAt: 3 } } });
+  assert.equal(cen.zclose, 4);
+  const b = cameraBasis({ tx: 0, ty: 0, zoom: 2, pitch: 20 * DEG, yaw: 0, roll: 0 }, 1080, 1080, 820);
+  const k1 = lens(b, [0, 0]).K;
+  b.ap = 0.21;
+  assert.ok(Math.abs(lens(b, [0, 0]).K / k1 - 0.21) < 1e-9, 'aperture scales with b.ap');
+  delete b.ap;
+  assert.equal(lens(b, [0, 0]).K, k1);
 });
 
 if (failures) { console.log(`\n${failures} failing`); process.exit(1); }

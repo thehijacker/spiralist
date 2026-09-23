@@ -28,12 +28,14 @@ import { STRIDE, pacingTable } from './spiral.js';
 import { hexToRgb, BRUSHES, PAPERS, LOOKS, brushById, paperById } from './materials.js';
 import { brushWet } from './brushes.js';
 import { paperPhysics } from './papers.js';
-import { WetSim, WET_GRID, STEPS_DRAW, STEPS_SETTLE, FRAG_WET_STEP, wetParams, wetMobile, poolGrow, dyeSheen } from './wetsim.js';
+import { WetSim, WET_GRID, STEPS_DRAW, STEPS_SETTLE, FRAG_WET_STEP, wetParams, wetMobile, poolGrow, dyeSheen, fibreHair, cockleHeight, feedDeficit } from './wetsim.js';
 
 const COMPLETION_STATUS_KHR = 0x91B1;
 
 const BYTES = STRIDE * 4;
 const DEG = Math.PI / 180;
+// The sheet width every physical size in the shaders is calibrated on (setSheetMm's default).
+const REF_SHEET_MM = 210;
 // The default key light: soft window light from the upper left (the look every still was tuned
 // under). Azimuth is the direction TOWARD the light on the sheet (x right, y down), radians.
 const LIGHT0 = { azimuth: Math.atan2(-0.65, -0.55), elevation: 40 * DEG, intensity: 1, warmth: 0 };
@@ -99,6 +101,7 @@ export class Renderer {
       pacing: 'natural',
       light: { ...LIGHT0, view: [0, 0, 1] },
       time: null,                   // seconds, once setTime is called (neon flicker, glints)
+      sheetMm: REF_SHEET_MM,        // the sheet's physical width (setSheetMm)
     };
     this.lost = false;
     this.stats = { wetSteps: 0, wetMs: 0 };
@@ -140,6 +143,7 @@ export class Renderer {
     this.pointBuf = gl.createBuffer();
     this.colorBuf = gl.createBuffer();
     this.paceBuf = gl.createBuffer();
+    this.feedBuf = gl.createBuffer();   // the pen's ink supply per point (wetsim.js feedDeficit)
     this.uploaded = 0;          // points in the GPU buffer
     this.hasColors = false;
     this.paperKey = null;
@@ -580,6 +584,25 @@ export class Renderer {
     this.s.light = L;
   }
 
+  /**
+   * The sheet's physical width in mm (default 210: today's look exactly). Paper grain, tooth, felt
+   * marks, flocs and cockle, the fibres, a charcoal's grit, a crayon's crumbs, chalk powder, the
+   * feathering hairs and the wet simulation's transport all keep their real millimetre size, so a
+   * 1 m sheet shows grain five times finer (relative to the sheet) than an A4 one, not the same
+   * grain blown up. The line's own width is the geometry's (the Realistic generators size it from
+   * the tool's real width). Redraws everything on change.
+   */
+  setSheetMm(mm) {
+    mm = Number.isFinite(+mm) && +mm > 0 ? Math.max(20, Math.min(3000, +mm)) : REF_SHEET_MM;
+    if (mm === this.s.sheetMm) return;
+    this.s.sheetMm = mm;
+    this.dirty = true; this.simDirty = true; this.gen++;
+    if (this.sim) this.sim.physKey = null;
+  }
+
+  /** Physical scale: 1 on the 210 mm reference sheet, 0.21 on a 1 m sheet (texture sizes / sheet). */
+  get physK() { return REF_SHEET_MM / (this.s.sheetMm || REF_SHEET_MM); }
+
   /** Scene time in seconds (neon flicker); null turns it off (stills). Composite only. */
   setTime(seconds) { this.s.time = Number.isFinite(seconds) ? +seconds : null; }
 
@@ -605,6 +628,9 @@ export class Renderer {
       gl.bindBuffer(gl.ARRAY_BUFFER, this.colorBuf);
       gl.bufferData(gl.ARRAY_BUFFER, geom.colors, gl.STATIC_DRAW);
     }
+    // how far the pen's feed has fallen behind along the line (a function of the geometry only)
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.feedBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, feedDeficit(geom, geom.technique === 'wave' ? 0.4 : 0.65), gl.STATIC_DRAW);
     this.uploaded = geom.n;
     this.simClockSrc = null;      // (a clock is in this geometry's point indices)
     this._uploadPace();
@@ -704,14 +730,17 @@ export class Renderer {
   // ---------------------------------------------------------------------------------- drawing
   _grainUniforms(p, W = this.s.paperW) {
     const gl = this.gl;
-    const tilePx = W / TILES_ACROSS;
+    // (on a bigger sheet every physical texture covers fewer of its px: physK < 1)
+    const k = this.physK;
+    const tilePx = W / TILES_ACROSS * k;
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.tileTex.tex);
     gl.uniform1i(this._u(p, 'uPaperTex'), 1);
     gl.uniform1f(this._u(p, 'uTilePx'), tilePx);
     gl.uniform1f(this._u(p, 'uTileLod'), Math.log2(TILE_SIZE / tilePx));
     gl.uniform1f(this._u(p, 'uPaperPx'), W);
-    gl.uniform1f(this._u(p, 'uU'), W / 1000);
+    gl.uniform1f(this._u(p, 'uU'), W / 1000 * k);
+    gl.uniform1f(this._u(p, 'uPhysPx'), W * k);
   }
 
   _bindSegments(i0) {
@@ -733,6 +762,9 @@ export class Renderer {
     gl.bindBuffer(gl.ARRAY_BUFFER, this.paceBuf);
     // (time, curvature) of points i and i+1: 4 floats from point i, stepping one point per instance
     gl.enableVertexAttribArray(5); gl.vertexAttribPointer(5, 4, gl.FLOAT, false, 8, i0 * 8); gl.vertexAttribDivisor(5, 1);
+    // the feed's deficit at points i and i+1 (Stroke.feed)
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.feedBuf);
+    gl.enableVertexAttribArray(6); gl.vertexAttribPointer(6, 2, gl.FLOAT, false, 4, i0 * 4); gl.vertexAttribDivisor(6, 1);
   }
 
   /**
@@ -760,7 +792,14 @@ export class Renderer {
     gl.uniform1f(this._u(p, 'uMobile'), wet ? wetMobile(wet, paperPhysics(s.paper)) : 0);
     gl.uniform1f(this._u(p, 'uDwellK'), 0.8);
     gl.uniform1f(this._u(p, 'uPoolGrow'), wet ? poolGrow(wet, paperPhysics(s.paper)) : 0);
-    gl.uniform1f(this._u(p, 'uPoolAt'), wet ? wet.poolAt : 0);
+    // A Realistic drawing's dwell is the hand's slowness in dense passages (squiggles, scribbles: the
+    // pen keeps moving at 10-30 mm/s, js/real), not a nib standing still: a moving nib does not blot.
+    // Even dwell at its cap (6) is a dense zigzag, where blots read as random ink spills; the
+    // passage darkens anyway where the wet line crosses itself (the simulation merges it). So a
+    // Realistic line never pools (geom.real.pools = true lets a generator that marks true stops
+    // with dwell opt back in).
+    const realPool = s.geom?.real && !s.geom.real.pools ? 1e3 : 0;
+    gl.uniform1f(this._u(p, 'uPoolAt'), wet ? wet.poolAt + realPool : 0);
     // the sheet's physics, for media that react to it in the stroke (feathering, capillary dots)
     const ph = paperPhysics(s.paper);
     gl.uniform1f(this._u(p, 'uPaperAbsorb'), ph.absorb);
@@ -823,7 +862,7 @@ export class Renderer {
     gl.activeTexture(gl.TEXTURE0);
     gl.uniform1i(this._u(p, 'uSrc'), 0);
     const gw = this.glowA.w, gh = this.glowA.h;
-    const U = this.s.paperW / 1000 / 4;           // one paper unit in quarter-res texels
+    const U = this.s.paperW / 1000 / 4 * this.physK;   // one paper unit in quarter-res texels
     const pass = (src, dst, down, dx, dy, radiusU) => {
       gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo);
       gl.viewport(0, 0, gw, gh);
@@ -860,7 +899,7 @@ export class Renderer {
     sim.prog = this._wetProg();       // (the renderer's; built by now unless this renderer blocks)
     const gw = WET_GRID, gh = Math.min(this.maxSize, this.gridH || WET_GRID);
     if (!sim.alloc(gw, gh)) { this.simOff = true; return false; }
-    const physKey = `${this.paperKey}|${gw}x${gh}`;
+    const physKey = `${this.paperKey}|${gw}x${gh}|${s.sheetMm}`;
     if (sim.physKey !== physKey) {
       const p = this._physProg();
       const ph = paperPhysics(s.paper);
@@ -894,7 +933,9 @@ export class Renderer {
       gl.disable(gl.BLEND);
       gl.blendEquation(gl.FUNC_ADD);
       gl.bindVertexArray(null);
-      this.simParams = wetParams(brushWet(s.brush), paperPhysics(s.paper));
+      // (the grid is fixed per sheet: on a big sheet a cell is coarser, and the transport rates per
+      // cell shrink so a bleed or a wick still travels its real distance in mm)
+      this.simParams = wetParams(brushWet(s.brush), paperPhysics(s.paper), this.physK);
       this._buildSimClock();
       this._simSchedule(gw, gh);
       sim.reset();
@@ -1059,7 +1100,7 @@ export class Renderer {
     gl.uniform3fv(this._u(p, 'uInk'), hexToRgb(s.ink));
     gl.uniform1i(this._u(p, 'uPhotoColor'), s.photoColor && this.hasColors ? 1 : 0);
     gl.uniform1i(this._u(p, 'uMaterial'), MATERIALS[brush.material] ?? MATERIALS.ink);
-    gl.uniform1f(this._u(p, 'uSurfU'), SURF_UNIT_U * s.paperW / 1000);
+    gl.uniform1f(this._u(p, 'uSurfU'), SURF_UNIT_U * s.paperW / 1000 * this.physK);
     gl.uniform1f(this._u(p, 'uSeed'), s.seed);
     // light
     const L = s.light;
@@ -1072,7 +1113,15 @@ export class Renderer {
     gl.uniform4f(this._u(p, 'uEye'), eye ? eye[0] * pw : 0, eye ? eye[1] * pw : 0, eye ? eye[2] * pw : 0, eye ? 1 : 0);
     gl.uniform1f(this._u(p, 'uCotEl'), cot(L.elevation));
     const w = L.warmth, tint = w >= 0 ? [1 + 0.06 * w, 1 - 0.02 * w, 1 - 0.16 * w] : [1 + 0.1 * w, 1 + 0.01 * w, 1 - 0.08 * w];
-    gl.uniform3f(this._u(p, 'uLightCol'), tint[0] * L.intensity, tint[1] * L.intensity, tint[2] * L.intensity);
+    // A camera meters for the sheet: under a raking lamp the tooth's shaded flanks and cast shadows
+    // outweigh its lit ones (the paper's relief knee is deeper on the dark side), so blank paper
+    // comes out ~2% darker than under the window and a drawing reads greyer. Exposing for the paper
+    // gives that back. 1 at the window light and anything higher (overhead, the film's rising
+    // light), so stills and films there are unchanged.
+    const gk = cot(L.elevation) / cot(LIGHT0.elevation);
+    const expo = 1 + 0.021 * Math.max(0, Math.min(1, (gk - 1.5) / 2.45));
+    const I = L.intensity * expo;
+    gl.uniform3f(this._u(p, 'uLightCol'), tint[0] * I, tint[1] * I, tint[2] * I);
     gl.uniform1f(this._u(p, 'uTime'), s.time ?? 0);
     gl.uniform1i(this._u(p, 'uTimeOn'), s.time == null ? 0 : 1);
     // wet layer
@@ -1093,7 +1142,7 @@ export class Renderer {
       gl.uniform1f(this._u(p, 'uGranD'), bw.gran * 0.35);
       gl.uniform2f(this._u(p, 'uSheetPx'), s.paperW, s.paperH);
       gl.uniform2f(this._u(p, 'uSimTexel'), 1 / sim.w, 1 / sim.h);
-      gl.uniform1f(this._u(p, 'uCellU'), 1000 / sim.w);
+      gl.uniform1f(this._u(p, 'uCellU'), 1000 / (sim.w * this.physK));
       gl.uniform1f(this._u(p, 'uWetH'), 2.2);
       gl.uniform1f(this._u(p, 'uSimScale'), sim.scaleA);
       // (at most mip 2: its 4-px blocks line up with a strip export's origins, which are multiples
@@ -1105,6 +1154,13 @@ export class Renderer {
       // colourant the fibres drank (bleeds, stains): not cut by the surface water's hard edge
       gl.activeTexture(gl.TEXTURE8); gl.bindTexture(gl.TEXTURE_2D, sim.soakOld); gl.uniform1i(this._u(p, 'uSimC0'), 8);
       gl.activeTexture(gl.TEXTURE9); gl.bindTexture(gl.TEXTURE_2D, sim.soakNew); gl.uniform1i(this._u(p, 'uSimC1'), 9);
+      // feathering along single fibres at the output's resolution (wetsim.js WET_HAIR_GLSL)
+      const phW = paperPhysics(paper), fh = fibreHair(bw, phW);
+      gl.uniform1f(this._u(p, 'uHair'), fh.on && !s.photoColor ? fh.k : 0);
+      gl.uniform1f(this._u(p, 'uHairN'), fh.n);
+      gl.uniform1f(this._u(p, 'uHairReach'), fh.reach);
+      gl.uniform2f(this._u(p, 'uHairDir'), Math.cos(phW.grainDeg * DEG), Math.sin(phW.grainDeg * DEG));
+      gl.uniform1f(this._u(p, 'uCockle'), cockleHeight(bw, phW));
     } else {
       // samplers must still point at valid textures of the right kind
       for (const [unit, name] of [[4, 'uSimA0'], [5, 'uSimA1'], [6, 'uSimB'], [7, 'uSimInj'], [8, 'uSimC0'], [9, 'uSimC1']]) {
@@ -1251,6 +1307,44 @@ export class Renderer {
     if (v.sheetFbo) this.gl.deleteFramebuffer(v.sheetFbo);
   }
 
+  /**
+   * Show part of the sheet on the canvas from renderToTexture images (the app's zoom loupe).
+   * view = [x0, y0, x1, y1] (sheet fractions) fills the canvas; layers = up to two { tex, rect }
+   * (rect = the coverage renderToTexture returned), the second drawn over the first wherever it
+   * covers. One textured triangle, so a gesture can pan and zoom the last images every frame while
+   * a sharp one is made. A layer rendered for exactly this view at the canvas's size (view origin
+   * on a whole texel) maps each pixel onto one texel centre: the same image as a full render.
+   */
+  present(view, layers) {
+    if (this.lost || this.gl.isContextLost() || !layers?.length) return false;
+    const gl = this.gl, s = this.s;
+    // (tiny, so compiled on the spot; remade after a context loss like every program)
+    const p = this.progs.present || (this.progs.present = this._program(VERT_FULL, FRAG_PRESENT));
+    const Wc = s.width, Hc = s.height;
+    const vw = view[2] - view[0], vh = view[3] - view[1];
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, Wc, Hc);
+    gl.disable(gl.BLEND);
+    gl.useProgram(p);
+    gl.bindVertexArray(this.emptyVao);
+    for (let i = 0; i < 2; i++) {
+      const L = layers[Math.min(i, layers.length - 1)];
+      const r = L.rect, rw = r[2] - r[0], rh = r[3] - r[1];
+      // texture uv as an affine function of gl_FragCoord, worked out here in doubles: at deep zoom
+      // the sheet position itself would lose the sub-texel precision in float32
+      const sx = vw / (Wc * rw), bx = (view[0] - r[0]) / rw;
+      const sy = vh / (Hc * rh), by = 1 - (view[3] - r[1]) / rh;
+      gl.activeTexture(gl.TEXTURE0 + i);
+      gl.bindTexture(gl.TEXTURE_2D, L.tex);
+      gl.uniform1i(this._u(p, i ? 'uT1' : 'uT0'), i);
+      gl.uniform4f(this._u(p, i ? 'uM1' : 'uM0'), sx, sy, bx, by);
+    }
+    gl.uniform1i(this._u(p, 'uTwo'), layers.length > 1 ? 1 : 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.activeTexture(gl.TEXTURE0);
+    return true;
+  }
+
   /** Blank paper only (no line), e.g. before a photo is loaded. */
   renderBlank() {
     if (this.lost || !this.s.paper || !this.s.brush || !this.pig) return false;
@@ -1269,3 +1363,21 @@ export class Renderer {
     this.lost = true;
   }
 }
+
+// present(): up to two sheet images mapped onto the canvas; the second wins wherever it covers.
+// uM = (uv per fragment px x, y, uv at fragment 0 x, y). Outside both, the first image's edge.
+const FRAG_PRESENT = /* glsl */`#version 300 es
+precision highp float;
+uniform sampler2D uT0, uT1;
+uniform vec4 uM0, uM1;
+uniform int uTwo;
+out vec4 outColor;
+void main() {
+  vec2 f = gl_FragCoord.xy;
+  vec2 a = f * uM0.xy + uM0.zw;
+  vec2 b = f * uM1.xy + uM1.zw;
+  // (both sampled outside any branch: mip selection needs derivatives in uniform control flow)
+  vec4 c0 = texture(uT0, a), c1 = texture(uT1, b);
+  bool in1 = uTwo == 1 && all(greaterThanEqual(b, vec2(0.0))) && all(lessThanEqual(b, vec2(1.0)));
+  outColor = in1 ? c1 : c0;
+}`;

@@ -54,7 +54,7 @@ layout(location = 1) out vec4 oB;
 layout(location = 2) out vec4 oSoak;
 uniform sampler2D uA;
 uniform sampler2D uB;
-uniform sampler2D uC;       // x: colourant caught in the fibres (never moves again)
+uniform sampler2D uC;       // x: colourant caught in the fibres (never moves again), y: cockle
 uniform sampler2D uInj;
 uniform sampler2D uPhys;
 uniform vec2 uWin;          // injection window (t0, t1] in pen time
@@ -196,10 +196,27 @@ void main() {
   float thinM = 1.0 - smoothstep(0.03, 0.25, M);
   float catchD = D * clamp(uFilter * uDryMul * (1.0 + uTide * thinM) + 1.0 - smoothstep(0.004, 0.03, M), 0.0, 1.0);
   D -= catchD;
-  float soakP = texelFetch(uC, p, 0).x * uScaleA + catchD;
+  vec4 cC = texelFetch(uC, p, 0) * uScaleA;
+  float soakP = cC.x + catchD;
+  // Cockling (C.y): paper fibres swell as they take on water and do not shrink back evenly, so a
+  // sheet that got very wet keeps a low swell there once dry, a few millimetres wide, following the
+  // passages (a wash, a run of close, loaded brush lines), not each line. C.y relaxes toward the
+  // wet extent (B.x, which is kept forever) through a wide stencil: a screened diffusion whose
+  // equilibrium is the extent low-passed over ~3 mm (taps 1, 2 and 4 cells out along both axes:
+  // ~2.4 cells^2 of spread per step, and every ripple finer than that is damped, pulled 1.2% per
+  // step toward the extent). The composite lights its slope; how high it stands per medium and
+  // sheet is cockleHeight() (a pen's lines hardly buckle a sheet).
+  float ck1 = 0.0, ck2 = 0.0, ck4 = 0.0;
+  for (int i = 0; i < 4; i++) {
+    ck1 += texelFetch(uC, clamp(p + OFF[i], ivec2(0), hi), 0).y;
+    ck2 += texelFetch(uC, clamp(p + 2 * OFF[i], ivec2(0), hi), 0).y;
+    ck4 += texelFetch(uC, clamp(p + 4 * OFF[i], ivec2(0), hi), 0).y;
+  }
+  float ckA = 0.04 * cC.y + (0.12 * ck1 + 0.07 * ck2 + 0.05 * ck4) * uScaleA;
+  float cockle = ckA + 0.012 * (max(bC.x, smoothstep(0.004, 0.04, W)) - ckA);
 
   oA = vec4(W, S, P, M) / uScaleA;
-  oSoak = vec4(soakP, 0.0, 0.0, 0.0) / uScaleA;
+  oSoak = vec4(soakP, cockle, 0.0, 0.0) / uScaleA;
   // the edge's pull for the next step: exposure here, or what reaches in from the rim (a decaying
   // average of the neighbours, which spreads in round contours rather than the grid's diamonds)
   float f = W > 1e-3 ? max(edge, 0.97 * fSum / 6.0) : 0.0;
@@ -208,13 +225,224 @@ void main() {
   oB = vec4(max(bC.x, smoothstep(0.004, 0.04, W)), f, age, D);
 }`;
 
+// The composite's fibre-scale wet detail (shaders.js FRAG_COMPOSITE, wet media only): feathering
+// hairs (fibreHairs) and the sheet's cockle (cockleShade, below).
+// The grid's cell is ~0.2 mm; a paper fibre is ~0.03 mm wide and 0.3-1.5 mm long, so the last
+// step of the liquid's travel, along single fibres out of a wet line, is walked here at the
+// output's own resolution. Single fibres (uHairN per 0.5 mm cell, two candidates per cell) lie
+// along the sheet's fibre orientation (papers.js fibreAngle, the same field the grid's anisotropic
+// bleed uses), loosely. A fibre that touches ink anywhere along its length draws the ink along
+// itself, thinning with the distance travelled (uHairReach U), and a second, shorter fibre
+// branching off it where they cross carries on from there: hair-like spikes, bunched where the
+// sheet's flocs are thirsty. The source is the simulated state only (the line's coverage on the
+// grid once the simulation has reached it, and the colourant the fibres drank), so the hairs grow
+// with the bleed, are a pure function of drawing progress, and are identical in a preview, a strip
+// of an export and a film frame (sheet-space samples only). Each hair is box-filtered over the
+// pixel, so a preview shows their mean as a faint fringe and holds the ink a 4K render has.
+// Needs COMMON (hashU, vnoise), fibreAngle (papers.js), uU, uSeed and the composite's sim uniforms.
+export const WET_FIBRE_GLSL = /* glsl */`
+uniform float uCockle;      // sheet height, U, per unit of the wetness it took on (0 = flat)
+uniform float uHair;        // 0 = off; how readily the sheet feathers x the medium's wick
+uniform float uHairN;       // share of candidate fibres that drink
+uniform float uHairReach;   // how far ink travels along a fibre, U
+uniform vec2 uHairDir;      // the sheet's machine direction (unit, sheet axes)
+vec4 hairH4(vec2 c, uint salt) {
+  uint h = hashU(uvec2(ivec2(floor(c)) + 8192) + uvec2(salt * 7919u, salt * 3571u + 17u));
+  return vec4(uvec4(h, h >> 8u, h >> 16u, h >> 24u) & 255u) / 255.0;
+}
+// the ink a fibre can drink at P (sheet px): the line where the simulation has already wetted the
+// sheet (its extent, B.x: the pen time of the ink map is no gate here, since filtering it blends a
+// future line's time with the blank paper beside it), and what the fibres already hold
+// (sheet-space samples: the same in every strip)
+float hairSrc(vec2 P) {
+  vec2 s = vec2(P.x / uSheetPx.x, 1.0 - P.y / uSheetPx.y);
+  // (explicit LOD: the grids have no mips, so this is the same sample, and a loop without
+  // gradient sampling compiles as a loop instead of being unrolled 108 times)
+  float laid = textureLod(uSimInj, s, 0.0).z * clamp(2.0 * textureLod(uSimB, s, 0.0).x, 0.0, 1.0);
+  float c = mix(textureLod(uSimC0, s, 0.0).x, textureLod(uSimC1, s, 0.0).x, uSimFrac) * uSimScale;
+  return clamp(1.4 * laid + 6.0 * c, 0.0, 1.0);
+}
+float hairSoak(vec2 P) {
+  vec2 s = vec2(P.x / uSheetPx.x, 1.0 - P.y / uSheetPx.y);
+  return clamp(6.0 * mix(textureLod(uSimC0, s, 0.0).x, textureLod(uSimC1, s, 0.0).x, uSimFrac) * uSimScale, 0.0, 1.0);
+}
+// box-filtered coverage of a hair w px wide whose axis is d px from the pixel centre
+float hairBox(float d, float w) { return max(0.0, min(d + 0.5 * w, 0.5) - max(d - 0.5 * w, -0.5)); }
+float fibreHairs(vec2 P) {
+  vec2 pu = P / uU;
+  float ang0 = fibreAngle(pu, uHairDir);
+  const float C = 2.5;                                  // U per candidate cell
+  vec2 ci = floor(pu / C);
+  // fibres drink in clumps (the sheet's flocs): the spikes burst out in places, not all along
+  float clump = smoothstep(0.3, 0.85, vnoise(pu / 11.0 + uSeed * 5.3));
+  float pN = uHairN * (0.2 + 1.8 * clump);
+  float best = 0.0, s0 = -1.0;
+  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) for (int k = 0; k < 2; k++) {
+    vec2 c = ci + vec2(float(x), float(y));
+    vec4 r = hairH4(c, 41u + uint(k) * 13u);
+    if (r.w > pN) continue;
+    vec4 r2 = hairH4(c, 47u + uint(k) * 13u);
+    float Lh = C * (0.4 + 0.6 * r2.x);                  // half length, U (1-2.5)
+    vec2 cp = (c + r.xy) * C * uU;                      // centre, px
+    float ang = ang0 + (r.z - 0.5) * 1.6;
+    vec2 t = vec2(cos(ang), sin(ang));
+    // the branch: a shorter fibre leaving this one at a random point, at an angle
+    float bj = (r2.y - 0.5) * 1.2 * Lh;                 // junction, U along the main fibre
+    float bang = ang + (r2.z > 0.5 ? 1.0 : -1.0) * (0.45 + 0.5 * r2.w);
+    vec2 tb = vec2(cos(bang), sin(bang));
+    vec2 jp = cp + t * bj * uU;
+    float Lb = 0.45 * Lh;
+    vec2 dp = P - cp, db = P - jp;
+    float along = dot(dp, t) / uU, alongB = dot(db, tb) / uU;
+    float wPx = (0.13 + 0.12 * r2.x) * uU;              // 25-50 um: the ink in and between the fibres
+    float dM = abs(t.x * dp.y - t.y * dp.x), dB = abs(tb.x * db.y - tb.y * db.x);
+    bool onM = abs(along) <= Lh && dM < 0.5 * wPx + 0.5;
+    bool onB = alongB >= 0.0 && alongB <= Lb && dB < 0.4 * wPx + 0.5;
+    if (!onM && !onB) continue;
+    // (what the fibres here already hold: a hair only shows where it carries the ink beyond that, so
+    // a fibre inside an evenly soaked halo adds nothing and the halo is not crazed with lines)
+    if (s0 < 0.0) s0 = hairSoak(P);
+    // the capillary walk along the main fibre: ink enters where the fibre touches ink and thins
+    // over reach as it travels (six samples over its length)
+    float reach = uHairReach * (0.5 + 0.5 * r2.w);
+    float hM = 0.0, hJ = 0.0;
+    for (int j = 0; j < 6; j++) {
+      float aj = (float(j) / 5.0 * 2.0 - 1.0) * Lh;
+      float s = hairSrc(cp + t * aj * uU);
+      hM = max(hM, s * (1.0 - abs(along - aj) / reach));
+      hJ = max(hJ, s * (1.0 - abs(bj - aj) / reach));
+    }
+    // (a hair narrows toward its tip as the ink runs out, and carries the dye thinner than the line)
+    hM = clamp(hM - s0, 0.0, 1.0);
+    if (onM) best = max(best, 0.75 * hM * hairBox(dM, wPx * (0.35 + 0.65 * hM)));
+    // the branch carries on from the junction, with what reached it
+    float hB = clamp(hJ - alongB / reach - s0, 0.0, 1.0);
+    if (onB) best = max(best, 0.75 * hB * hairBox(dB, 0.8 * wPx * (0.35 + 0.65 * hB)));
+  }
+  return best;
+}
+// Cockling: paper that got very wet buckles. Its fibres swell across their length as they take on
+// water; the soaked patch grows but the dry sheet around it holds it, so it pushes up into soft
+// waves (ridges roughly along the grain, since the sheet swells most across it) some 1-3 cm
+// apart, and the fibres set in that shape as they dry: the waves stay. How wet each place got is
+// the simulation's C.y (the wet extent low-passed over ~3 mm, kept after drying), averaged again
+// over ~1 cm here: a buckle belongs to a soaked region, a wash or a run of close, loaded brush
+// lines, never to a single line. Only heavily wetted regions buckle (a threshold on that average),
+// the height is uCockle (per medium and sheet, cockleHeight) and every length is in paper units,
+// so the waves keep their real size on a big sheet (renderer.setSheetMm). Lit like the paper's
+// relief: diffuse linear in the slope along the light, times cot(elevation): barely a shimmer
+// under the window light, plain rolling waves under a raking one, flat from above. Sheet-space
+// samples only (identical in a preview, a strip of an export and a film frame).
+float cockleAt(vec2 s) { return textureLod(uSimC1, s, 0.0).y * uSimScale; }
+// how wet the region around P (px) got: ~1 cm average of C.y, then the buckling threshold
+float soakRegion(vec2 P) {
+  vec2 s = vec2(P.x / uSheetPx.x, 1.0 - P.y / uSheetPx.y);
+  vec2 r = 28.0 * uU / uSheetPx;                        // ~6 mm, in sheet fractions
+  float w = 0.2 * cockleAt(s);
+  for (int i = 0; i < 8; i++) {
+    float a = float(i) * 0.7854 + 0.39;
+    w += 0.1 * cockleAt(s + vec2(cos(a), sin(a)) * r);
+  }
+  return smoothstep(0.1, 0.45, w);
+}
+// sheet height (px) at P: soft buckles where it soaked
+float buckleAt(vec2 P) {
+  vec2 pu = P / uU;                                     // paper units (0.21 mm)
+  vec2 g = uHairDir, n = vec2(-g.y, g.x);
+  // wavy ridges ~2 cm apart along the grain, broken into elongated domes ~4-6 cm long
+  float warp = 30.0 * (vnoise(pu / 190.0 + 3.7 + uSeed) - 0.5) + 14.0 * (vnoise(pu / 70.0 + 9.1) - 0.5);
+  float across = dot(pu, n) + warp, along = dot(pu, g);
+  float lam = 95.0 * (0.85 + 0.3 * vnoise(pu / 260.0 + 1.3));
+  float wave = cos(6.2832 * across / lam) * (0.55 + 0.45 * cos(6.2832 * along / 240.0 + 2.0 * vnoise(pu / 150.0 + 5.3)));
+  return uCockle * uU * soakRegion(P) * (0.35 + 0.65 * wave);
+}
+float cockleShade(vec2 P) {
+  vec2 dir = normalize(uPaperLight);                    // away from the light (paper space)
+  float d = 7.0 * uU;                                   // ~1.5 mm baseline
+  float slope = (buckleAt(P + dir * d) - buckleAt(P - dir * d)) / (2.0 * d);   // + = facing the light
+  float x = slope * uCotEl;
+  // soft limits (a steep buckle's lit flank never burns out, its far side keeps some light)
+  return 1.0 + (x >= 0.0 ? 0.35 * (1.0 - exp(-x / 0.35)) : -0.4 * (1.0 - exp(x / 0.4)));
+}
+`;
+
+/**
+ * Fibre-scale feathering uniforms (WET_FIBRE_GLSL) for a medium on a paper: how readily the sheet
+ * lets a wet line creep out along its fibres (thirsty, unsized, fibrous sheets; nothing on sized
+ * or coated ones), times the share of the colour that travels with the water (wet.wick).
+ * Returns { on, k, n, reach } (on = false: the composite skips the walk).
+ */
+export function fibreHair(wet, phys) {
+  const thirst = Math.min(1, Math.max(0, (phys.absorb * (1 - phys.sizing) - 0.07) * 3.2)) * (0.35 + 0.65 * phys.fibre);
+  // (dye travels with the water; soot and pigment particles are mostly filtered out near the line)
+  const k = thirst * (wet.wick ?? wet.dye ?? 0.5) * (0.3 + 0.7 * (wet.dye ?? 0.5));
+  // (k: the hairs' strength; a sheet that feathers at all shows them clearly at the fibre's scale)
+  return { on: k > 0.03, k: Math.min(0.8, 0.25 + 1.3 * k), n: 0.15 + 0.5 * thirst, reach: 0.7 + 1.8 * thirst };
+}
+
+/**
+ * The pen's ink supply along the line, per point: how far the feed has fallen behind (0 = full
+ * .. 1 = dry), for the stroke pass (Stroke.feed, brushes.js). A fountain pen's feed delivers ink at
+ * a limited rate and the nib holds a small reserve: a sustained demand (a broad line, drawn at
+ * speed) draws the reserve down over some 15-25 mm, so a long, heavy run pales gradually; where
+ * the hand slows or lingers (tight turns, maze corners, the darks' slow strokes) the feed catches
+ * up and the next stretch starts rich. Integrated along the line with the 'natural' pacing's model
+ * of the hand (the shader's st.speed), in circle units (1 = the art circle's radius, ~84 mm of the
+ * default sheet), so it is a pure function of the geometry: the same in a preview, a strip of an
+ * export and every film frame. Returns a Float32Array(n).
+ */
+export function feedDeficit(geom, paceK = 0.65) {
+  const { n, data } = geom, out = new Float32Array(n);
+  const ST = 7;                                         // spiral.js STRIDE (x, y, w, s, tone, turn, dwell)
+  let wRef = 0;
+  for (let i = 0; i < n; i++) wRef = Math.max(wRef, data[i * ST + 2]);
+  if (!(wRef > 0) || n < 2) return out;
+  // per circle unit of line: drain = demand (width x speed) against what is left; refill
+  // proportional to the time spent (1 / speed) and to what is missing
+  const KD = 1.6, KR = 2.4;                            // ~ 0.25 circle units (20 mm) to settle
+  let D = 0;
+  for (let i = 1; i < n; i++) {
+    const q = i * ST, p = q - ST;
+    const ds = Math.max(0, data[q + 3] - data[p + 3]);
+    const w = 2 * data[q + 2] / wRef, tone = data[q + 4], dwell = Math.max(1, data[q + 6]);
+    const v = (1 - paceK) / ((1 - paceK + paceK * tone) * dwell);
+    // (exact for constant coefficients over the step, so the result does not depend on how finely
+    // the line is sampled)
+    const a = KD * w, b = KR / Math.max(v, 0.05), k = a + b;
+    const Dinf = k > 0 ? a / k : 0;
+    D = Dinf + (D - Dinf) * Math.exp(-k * ds);
+    // what the line shows: the lag (a run paling as it goes on, a rich restart after a pause) in
+    // full, the steady level only in part, so the photo's darks keep their weight
+    out[i] = 0.25 + (D - Dinf) + 0.35 * (Dinf - 0.25);
+  }
+  return out;
+}
+
+/**
+ * Cockle height (U per unit of wetness the sheet took on, WET_FIBRE_GLSL uCockle): only heavy
+ * liquid loads buckle a sheet (washes, a loaded brush; a pen's line hardly), and a heavy, absorbent
+ * watercolour board less than thin sketch or kraft paper.
+ */
+export function cockleHeight(wet, phys) {
+  const heavy = Math.min(1, Math.max(0, (wet.load - 0.4) / 0.6));
+  // (U of buckle height: up to ~0.8 mm on thin sketch or kraft paper under a wash, a third of
+  // that on heavy cold-press board, which is why watercolourists use it)
+  return 4.0 * heavy * (1.15 - 0.75 * phys.capacity);
+}
+
 /**
  * Simulation parameters (per step) for a medium on a paper.
  * wet = brushWet(brush) (brushes.js), phys = paperPhysics(paper) (papers.js).
  */
-export function wetParams(wet, phys) {
+export function wetParams(wet, phys, physK = 1) {
   const { absorb, sizing, fibre, capacity } = phys;
-  return {
+  // physK = the renderer's physical scale (210 mm / sheet width, renderer.setSheetMm): the grid is
+  // fixed per sheet, so on a big sheet a cell spans more paper. Transport is diffusive (spread ~
+  // sqrt(D t)), so a rate per cell^2 scales with physK^2 for the liquid to travel the same mm; a
+  // drift across the rim (Deegan flow) scales with physK. Rates per step (drinking, evaporation,
+  // settling) are about time and stay. 1 = today's A4 sheet exactly.
+  const k2 = physK * physK;
+  const P = {
     // flow has to outrun evaporation by far, or a pinned edge dries before the interior can refill
     // it and the rims come out pale instead of dark
     uDiff: 0.055 * wet.flow,
@@ -249,6 +477,11 @@ export function wetParams(wet, phys) {
     uLayer: wet.layer ?? 1,
     uLayerDt: 2.5 / STEPS_DRAW,
   };
+  if (physK !== 1) {
+    P.uDiff *= k2; P.uCapF *= k2; P.uWick *= k2; P.uMix *= k2;
+    P.uRing *= physK;
+  }
+  return P;
 }
 
 /**
@@ -340,6 +573,8 @@ export class WetSim {
       rgba8: [gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE],
       r32f: [gl.R32F, gl.RED, gl.FLOAT],
       r16f: [gl.R16F, gl.RED, gl.HALF_FLOAT],
+      rg32f: [gl.RG32F, gl.RG, gl.FLOAT],
+      rg16f: [gl.RG16F, gl.RG, gl.HALF_FLOAT],
     }[fmt];
     gl.texImage2D(gl.TEXTURE_2D, 0, f[0], w, h, 0, f[1], f[2], null);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
@@ -376,8 +611,9 @@ export class WetSim {
       const fb = fmt === 'rgba8' ? 'rgba8' : 'rgba16f';
       this.B = [this._tex(w, h, fb, lin), this._tex(w, h, fb, lin)];
       // C: colourant caught in the fibres (stains, bleeds), kept apart from the surface deposit
-      // because it is not bounded by the surface water's hard edge. One channel (x) is all it needs.
-      const fc = { rgba32f: 'r32f', rgba16f: 'r16f', rgba8: 'rgba8' }[fmt];
+      // because it is not bounded by the surface water's hard edge (x), and the sheet's cockle (y).
+      // (y: the wetness the sheet took on, for cockling)
+      const fc = { rgba32f: 'rg32f', rgba16f: 'rg16f', rgba8: 'rgba8' }[fmt];
       this.C = [this._tex(w, h, fc, lin), this._tex(w, h, fc, lin)];
       const f0 = this._fboFor(`state:${fmt}`, this.A[0], this.B[0], this.C[0]), f1 = this._fboFor(`state:${fmt}`, this.A[1], this.B[1], this.C[1]);
       this.fbo = [f0.fbo, f1.fbo];

@@ -78,3 +78,24 @@ export const LOOKS = [
 ];
 
 export const lookById = id => LOOKS.find(l => l.id === id) || LOOKS[0];
+
+/**
+ * Realistic mode's tools: real drawing instruments at their real line width (mm). `sizes` lists
+ * the widths the tool comes in (first = default); `name` is what the tool is called in a shop
+ * (`chip` = a shorter label where the chip is narrow).
+ * Neon is left out: it is a light effect, not something a hand draws with.
+ */
+export const REAL_TOOLS = [
+  { brush: 'fineliner', name: 'Fineliner', sizes: [0.4, 0.3, 0.5, 0.8], ink: '#17171a', paper: 'cream' },
+  { brush: 'ballpoint', name: 'Ballpoint', sizes: [0.5], ink: '#1d3a8a', paper: 'cream' },
+  { brush: 'fountain', name: 'Fountain pen', sizes: [0.5], label: 'F 0.5 mm', ink: '#141a3a', paper: 'sketch' },
+  { brush: 'pencil', name: 'Pencil', sizes: [0.5, 0.7], ink: '#2a2a2e', paper: 'sketch' },
+  { brush: 'gold', name: 'Gold paint pen', sizes: [1], ink: '#d9b44a', paper: 'black' },
+  { brush: 'marker', name: 'Marker', sizes: [2], ink: '#2d2a32', paper: 'sketch' },
+  { brush: 'brush', name: 'Sumi brush', sizes: [3], ink: '#0e0e0e', paper: 'coldpress' },
+  { brush: 'watercolour', name: 'Watercolour brush', chip: 'Watercolour', sizes: [4], ink: '#2c4f8a', paper: 'coldpress' },
+  { brush: 'charcoal', name: 'Charcoal stick', sizes: [4], ink: '#1b1715', paper: 'coldpress' },
+  { brush: 'crayon', name: 'Wax crayon', sizes: [4], ink: '#1f5fa8', paper: 'kraft' },
+  { brush: 'chalk', name: 'Chalk', sizes: [5], ink: '#f3f0e8', paper: 'chalkboard' },
+];
+export const realToolFor = brushId => REAL_TOOLS.find(t => t.brush === brushId) || REAL_TOOLS[0];

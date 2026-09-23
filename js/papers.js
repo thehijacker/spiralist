@@ -8,16 +8,20 @@
 //   B = specks 0..1 (dark or light marks mixed toward `speck`)
 //   A = fibre albedo, 0.5 = neutral (lighter / darker strands); linear, so mips keep the mean
 //
-// Look: real sheets under soft window light from the upper left. Relief is lit linearly in the
-// texture's slope, and every other term is linear in a texture channel or lives at sheet scale,
-// so a preview and a box-downsampled 4K export have the same mean tone.
+// Look: real sheets under soft window light from the upper left (LIGHTS below also has a raking
+// and an overhead light). Relief is lit linearly in the texture's slope under the window light (a
+// soft knee only bends the rare steep slopes, and a low light), and every other term is linear in a
+// texture channel or lives at sheet scale, so a preview and a box-downsampled 4K export have the
+// same mean tone.
 
 export const SHEET_MM = 200;
 
 // Tile knobs (tile program): tooth = height std relative to 0.13, toothCells = tooth grains per
 // tile (~0.3 mm each at 110), bumps/bumpCells = cold-press domes, fibers = strand amount (from
 // 0.4 up also long strands and bundles), specks = speck density (from 0.5 up also sparse ~0.5 mm
-// bark specks). Surface knobs (composite): relief = light on the tooth, mottle = cloudy
+// bark specks), laid = felt marks (~0.5 x 1.5 mm dimples that let a sheet read as paper on a
+// full-sheet preview; the renderer passes it as uLaid). Surface knobs (composite): relief = light
+// on the tooth (lighting only: the brushes' grain does not change with it), mottle = cloudy
 // formation, smudge = chalkboard eraser haze + swirls, grid = blueprint grid.
 // Physical knobs (wet media, js/wetsim.js), all 0..1:
 //   absorb    how fast the sheet drinks standing liquid (blotting paper 1, a painted board ~0)
@@ -28,25 +32,25 @@ export const SHEET_MM = 200;
 //   grainDeg  machine direction of the fibres, degrees (0 = across the sheet)
 export const PAPERS = [
   { id: 'sketch', name: 'Sketchbook', color: '#f4f4f0', speck: '#8c887e', tooth: 0.9, toothCells: 120,
-    bumps: 0.4, bumpCells: 44, fibers: 0.35, specks: 0.12, relief: 0.35, mottle: 0.035, smudge: 0, grid: 0,
+    bumps: 0.4, bumpCells: 44, fibers: 0.35, specks: 0.12, relief: 0.65, mottle: 0.035, smudge: 0, grid: 0, laid: 0.7,
     absorb: 0.45, sizing: 0.45, fibre: 0.45, capacity: 0.45, grainDeg: 0 },
   { id: 'cream', name: 'Cream', color: '#f1e6cd', speck: '#9a8260', tooth: 0.93, toothCells: 104,
-    bumps: 0.55, bumpCells: 36, fibers: 0.5, specks: 0.3, relief: 0.42, mottle: 0.05, smudge: 0, grid: 0,
+    bumps: 0.55, bumpCells: 36, fibers: 0.5, specks: 0.3, relief: 0.62, mottle: 0.05, smudge: 0, grid: 0, laid: 0.7,
     absorb: 0.3, sizing: 0.7, fibre: 0.35, capacity: 0.4, grainDeg: 90 },
   { id: 'coldpress', name: 'Watercolour', color: '#f2ebdf', speck: '#958e80', tooth: 0.5, toothCells: 110,
-    bumps: 1.4, bumpCells: 22, fibers: 0.25, specks: 0.08, relief: 0.75, mottle: 0.045, smudge: 0, grid: 0,
+    bumps: 1.4, bumpCells: 22, fibers: 0.25, specks: 0.08, relief: 0.85, mottle: 0.045, smudge: 0, grid: 0,
     absorb: 0.4, sizing: 0.65, fibre: 0.15, capacity: 1.0, grainDeg: 0 },
   { id: 'kraft', name: 'Kraft', color: '#bf9366', speck: '#4f3622', tooth: 1.04, toothCells: 120,
-    bumps: 0.3, bumpCells: 30, fibers: 1.0, specks: 1.0, relief: 0.3, mottle: 0.09, smudge: 0, grid: 0,
+    bumps: 0.3, bumpCells: 30, fibers: 1.0, specks: 1.0, relief: 0.42, mottle: 0.09, smudge: 0, grid: 0, laid: 0.15,
     absorb: 0.55, sizing: 0.35, fibre: 0.8, capacity: 0.55, grainDeg: 0 },
   { id: 'black', name: 'Black card', color: '#1c1c1f', speck: '#45454b', tooth: 0.89, toothCells: 150,
-    bumps: 0, bumpCells: 1, fibers: 0.2, specks: 0.15, relief: 0.25, mottle: 0.03, smudge: 0, grid: 0, dark: true,
+    bumps: 0, bumpCells: 1, fibers: 0.2, specks: 0.15, relief: 0.55, mottle: 0.03, smudge: 0, grid: 0, laid: 0.2, dark: true,
     absorb: 0.35, sizing: 0.55, fibre: 0.3, capacity: 0.5, grainDeg: 0 },
   { id: 'chalkboard', name: 'Chalkboard', color: '#2d3c34', speck: '#6f7d74', tooth: 0.97, toothCells: 112,
-    bumps: 0, bumpCells: 1, fibers: 0, specks: 0.35, relief: 0.3, mottle: 0.09, smudge: 1.0, grid: 0, dark: true,
+    bumps: 0, bumpCells: 1, fibers: 0, specks: 0.35, relief: 0.5, mottle: 0.09, smudge: 1.0, grid: 0, laid: 0.3, dark: true,
     absorb: 0.04, sizing: 0.95, fibre: 0, capacity: 0.1, grainDeg: 0 },
   { id: 'blueprint', name: 'Blueprint', color: '#1b5796', speck: '#5b8ac2', tooth: 0.78, toothCells: 128,
-    bumps: 0.25, bumpCells: 40, fibers: 0.3, specks: 0.15, relief: 0.3, mottle: 0.06, smudge: 0, grid: 1, dark: true,
+    bumps: 0.25, bumpCells: 40, fibers: 0.3, specks: 0.15, relief: 0.5, mottle: 0.06, smudge: 0, grid: 1, laid: 0.4, dark: true,
     absorb: 0.15, sizing: 0.8, fibre: 0.25, capacity: 0.3, grainDeg: 90 },
 ];
 
@@ -60,9 +64,23 @@ export function paperPhysics(p) {
 
 export const paperById = id => PAPERS.find(p => p.id === id) || PAPERS[0];
 
-// Tile generator. Uniforms: uSeed, uTooth, uToothCells, uBumps, uBumpCells, uFibers, uSpecks
-// (uLaid is no longer used: straight laid lines cannot survive the renderer's rotated second
-// sampling of the tile). Everything tiles: integer lattice periods on both axes, and lattice
+// Named key lights for stills: pass one to renderer.setLight(LIGHTS.raking). Angles in radians
+// (azimuth = direction TOWARD the light on the sheet, x right / y down; elevation above it).
+//   window    soft window light from the upper left, 40 deg: the default every still was tuned under
+//   raking    a low lamp grazing in from the left at 12 deg: tooth, domes, grooves, wax build-up and
+//             the sheet's cockling stand out, each bump casting a short soft shadow
+//   overhead  a high light almost straight above, like a scanner: flat, the relief nearly gone
+const DEG = Math.PI / 180;
+export const LIGHTS = {
+  window: { id: 'window', name: 'Window', azimuth: Math.atan2(-0.65, -0.55), elevation: 40 * DEG, intensity: 1, warmth: 0 },
+  raking: { id: 'raking', name: 'Raking', azimuth: -168 * DEG, elevation: 12 * DEG, intensity: 1, warmth: 0.2 },
+  overhead: { id: 'overhead', name: 'Overhead', azimuth: -100 * DEG, elevation: 78 * DEG, intensity: 1, warmth: -0.05 },
+};
+export const lightById = id => LIGHTS[id] || LIGHTS.window;
+
+// Tile generator. Uniforms: uSeed, uTooth, uToothCells, uBumps, uBumpCells, uFibers, uSpecks and
+// uLaid, now the felt amount (straight laid lines, its old use, cannot survive the renderer's
+// rotated second sampling of the tile; a felt twill can). Everything tiles: integer lattice periods on both axes, and lattice
 // indices are wrapped with wrapL() instead of mod().
 export const PAPER_TILE_GLSL = /* glsl */`
 // Integer lattice wrap. mod(x, y) compiles to x - y * floor(x * rcp(y)) on some drivers (D3D), so
@@ -189,6 +207,21 @@ float specksP(vec2 uv, float cells, float density, float small, float big, float
   }
   return v;
 }
+// Felt marks: the woollen felt a wet sheet is pressed on prints a loose twill of short, shallow
+// elongated dimples (~0.5 x 1.5 mm) into its surface. Together with the formation it is what makes
+// a drawing paper read as paper at arm's length (a full-sheet preview, ~0.2 mm per px), where the
+// tooth itself is far below a pixel. Two stretched noise fields at right angles take turns in
+// patches, like a weave seen through a loupe. ~unit std.
+float feltP(vec2 uv, float cells) {
+  vec2 w = vec2(gnoiseP(uv * cells + vec2(0.3, 0.9), vec2(cells), 34.0),
+                gnoiseP(uv * cells + vec2(0.7, 0.1), vec2(cells), 35.0));
+  vec2 u = uv + w * (0.35 / cells);                      // wobble so no strand runs dead straight
+  vec2 pa = vec2(cells, cells * 3.0), pb = pa.yx;
+  float a = gnoiseP(u * pa, pa, 31.0) + 0.5 * gnoiseP(u * pa * 2.0 + 0.5, pa * 2.0, 36.0);
+  float b = gnoiseP(u * pb, pb, 32.0) + 0.5 * gnoiseP(u * pb * 2.0 + 0.5, pb * 2.0, 37.0);
+  float m = smoothstep(-0.12, 0.12, gnoiseP(uv * cells * 0.5 + 0.25, vec2(cells * 0.5), 33.0));
+  return mix(a, b, m) * 4.2;
+}
 vec4 paperTile(vec2 uv) {
   float cells = uToothCells;
   // Tooth: pebbly grains (~0.2-0.3 mm) roughened by a warped fBm.
@@ -204,6 +237,8 @@ vec4 paperTile(vec2 uv) {
     float bc2 = max(2.0, floor(bc * 0.5));
     h += 0.13 * uBumps * (domesP(uv + bw * (0.5 / bc), bc) + 0.5 * domesP(uv + bw * (0.5 / bc2), bc2));
   }
+  // (uLaid carries the felt amount: the renderer passes paper.laid, the old laid-line knob)
+  if (uLaid > 0.0) h += 0.13 * uLaid * feltP(uv, 22.0);
   float albedo = 0.0;
   if (uFibers > 0.0) {
     // fine strands everywhere; long straighter strands and fibre bundles in coarse sheets (kraft)
@@ -214,7 +249,9 @@ vec4 paperTile(vec2 uv) {
       f2 = fibreLayer(uv, 14.0, 0.9 * coarse, 0.9, 0.03, 0.35, 0.5, 81.0);
       f3 = fibreLayer(uv, 8.0, 0.6 * coarse, 0.8, 0.028, 0.25, 0.35, 91.0);
     }
-    h += 0.05 * max(f1.x, max(f2.x, f3.x));               // strands sit slightly proud
+    // strands sit slightly proud; kraft's long strands and bundles stand up enough to catch a low
+    // light (and a crayon skipping over the sheet)
+    h += 0.05 * f1.x + (0.05 + 0.07 * coarse) * max(f2.x, f3.x);
     // the long strands and bundles of coarse sheets carry more colour, so kraft's fibres still read
     // at preview size, where their width is well under a pixel
     albedo = clamp((f1.x * f1.y * 0.4 + f2.x * f2.y * mix(0.35, 0.48, coarse)
@@ -336,7 +373,7 @@ float chalkHaze(vec2 pu) {
   // (this offset of the broad haze cloud leaves the middle of a square sheet, under the drawing,
   // clear; the finer cloudiness between the patches is the formation mottle, uMottle)
   float haze = smoothstep(-0.08, 0.35, cloudW(pu * 2.3 + 3.0, vec4(0.533, 0.267, 0.133, 0.0))) * 0.55;
-  float streakAA = aa(0.0035 * uPaperPx);            // streak pitch ~0.7 mm, faded below ~2 px
+  float streakAA = aa(0.0035 * uPhysPx);             // streak pitch ~0.7 mm, faded below ~2 px
   // Swirls: centre (xy, hand-placed so a square sheet shows four around the drawing; the rest
   // serve tall sheets), loop radius (z), eraser pressure (w), and drift direction DIR. Radius,
   // pressure and direction are hash draws, baked here so no pixel pays for hashing them.
@@ -374,9 +411,13 @@ float chalkHaze(vec2 pu) {
 }
 vec3 paperSurface(vec2 P, out float shade) {
   vec2 pu = P / uPaperPx;                              // sheet units (1 = sheet width)
+  // physical units (1 = 210 mm of paper; = pu on the default sheet): everything with a real size
+  // (grain patches, flocs; the cockle waves up to ~42 cm) keeps it on a big sheet (renderer.setSheetMm); only what
+  // belongs to the sheet as a whole (the light's falloff, the sheen, the eraser swirls) uses pu
+  vec2 pm = P / uPhysPx;
   float lod = max(0.0, uTileLod);
   // grainAt's blend of its two samplings: the relief must match the grain the brushes read.
-  float mv = vnoise(pu * 7.0 + 3.1);
+  float mv = vnoise(pm * 7.0 + 3.1);
   float m = smoothstep(0.25, 0.75, mv);
   vec4 ta, tb;
   paperTaps(P, lod, ta, tb);
@@ -387,7 +428,7 @@ vec3 paperSurface(vec2 P, out float shade) {
   // smaller than a tile, and no patch keeps one sampling across a whole period.
   vec2 uv3 = mat2(0.3256, 0.9455, -0.9455, 0.3256) * (P / (uTilePx * 1.071)) + vec2(0.61, 0.17);
   vec2 marks = mix(ta.ba, tb.ba, smoothstep(0.47, 0.53, mv));
-  marks = mix(marks, textureLod(uPaperTex, uv3, lod).ba, smoothstep(0.55, 0.59, vnoiseF(pu * 13.0 + 5.7)));
+  marks = mix(marks, textureLod(uPaperTex, uv3, lod).ba, smoothstep(0.55, 0.59, vnoiseF(pm * 13.0 + 5.7)));
   vec4 t = vec4(mix(ta.rg, tb.rg, m), marks);
   // Relief: slope of the (mip-filtered) height per full-resolution texel, along the light only
   // (the key light needs nothing else, so a central difference along it costs two taps, not four).
@@ -397,21 +438,74 @@ vec3 paperSurface(vec2 P, out float shade) {
   // relief gain (lower light, longer shadows). The renderer's default is vec2(0.55, 0.65): soft
   // window light from the upper left (renderer.setLight changes it).
   vec2 L = uPaperLight;
+  float gain = length(L);
+  float gk = gain / 0.8509;                            // 1 under the window light, ~4 raking, ~0.2 overhead
+  vec2 dir = L / max(gain, 1e-5);                      // away from the light
   float e = max(1.0, exp2(-uTileLod));
-  vec2 dl = normalize(L) * e;
+  vec2 dl = dir * e;
   float slope = (paperTap(P + dl, lod, m).r - paperTap(P - dl, lod, m).r) / (2.0 * e * exp2(uTileLod));
   // Soft occlusion from the fine structure only (height minus its 4x coarser mean): pits read
   // darker, while broad domes are modelled by the key light instead of turning into blotches.
   float cavity = t.r - paperTap(P, lod + 2.0, m).r;
-  float lit = slope * length(L) * 2.4 + cavity * 0.25;   // key light + soft occlusion
-  // Window light: a very gentle falloff away from the upper left.
-  float fall = dot(pu - 0.5, vec2(-0.6, -0.8)) * 0.016;
-  shade = 1.0 + clamp(lit * uRelief, -0.3, 0.3) + fall;
+  // Cockling: no sheet lies dead flat. Broad, gentle waves (~70-130 mm, ridges mostly along one
+  // direction, as a sheet cockles along its grain) lit like the tooth, linear in the light's gain:
+  // a whisper under the window light, plain under a raking one, gone from straight above. A board
+  // (the chalkboard) stays flat. Slope along the light by a central difference over ~1 mm.
+  // A big sheet does not buckle in A4-sized cells: it lies in a few long, low waves (a real 1.5 m
+  // sheet on a desk shows 1-3). So the waves keep their real size up to a sheet of ~42 cm, then
+  // grow with the sheet (the longest stays ~1/3 of it) at the same height, i.e. gentler slopes
+  // (cs < 1 scales the slope back to physical units). At 210 mm cp = pm and cs = 1 exactly.
+  float ck = 0.0;
+  if (uSmudge < 0.5) {
+    const float EPS = 0.005;
+    float cDen = max(uPhysPx, 0.5 * uPaperPx);
+    float cs = uPhysPx / cDen;
+    vec2 cp = P / cDen;
+    vec2 q0 = cp + dir * EPS, q1 = cp - dir * EPS;
+    float w0 = 0.35 * (vnoiseF(q0 * 3.1 + 2.7) - 0.5), w1 = 0.35 * (vnoiseF(q1 * 3.1 + 2.7) - 0.5);
+    float c0 = sin(dot(q0, vec2(9.1, 2.3)) + 1.3 + 4.0 * w0) + 0.6 * sin(dot(q0, vec2(-3.1, 13.7)) + 0.4 + 3.0 * w0)
+             + 0.35 * sin(dot(q0, vec2(15.3, -8.9)) + 2.1);
+    float c1 = sin(dot(q1, vec2(9.1, 2.3)) + 1.3 + 4.0 * w1) + 0.6 * sin(dot(q1, vec2(-3.1, 13.7)) + 0.4 + 3.0 * w1)
+             + 0.35 * sin(dot(q1, vec2(15.3, -8.9)) + 2.1);
+    ck = (c1 - c0) / (2.0 * EPS) * 0.0011 * cs;        // + = facing the light
+  }
+  // A sheet is a translucent scatterer: light entering a lit facet leaks under into the shaded
+  // one, so its shading grows slower than a matte plaster's as the light drops (cot^0.7 rather
+  // than cot); a scanner's high light still shows a little tooth.
+  float gEff = 0.8509 * exp2(0.7 * log2(max(gk, 1e-4)));
+  float lit = slope * gEff * 2.4 + cavity * 0.25;      // key light + soft occlusion
+  // Soft knee instead of a hard clip: under the window light nearly every value lies on the
+  // linear part (so previews and exports keep the same mean); a raking light pushes the slopes
+  // facing away into deep, soft shade and the lit faces into a gentle shoulder.
+  float x = lit * uRelief + ck * gEff;
+  float s = x >= 0.0 ? min(x, 0.2) + 0.16 * (1.0 - exp(-max(x - 0.2, 0.0) / 0.16))
+                     : -(min(-x, 0.22) + 0.36 * (1.0 - exp(-max(-x - 0.22, 0.0) / 0.36)));
+  // Cast shadows (low light only): a dome or strand rising toward the light shades the valley
+  // behind it. The horizon toward the light is taken from mips matched to each step's length
+  // (0.1-0.9 mm), so the same shadows fall at every output size; soft, since the key light is a
+  // lamp, not a point.
+  float castSh = 0.0;
+  float rake = smoothstep(1.6, 3.2, gk);               // elevation below ~25 deg
+  if (rake > 0.0) {
+    float tpp = exp2(uTileLod);                        // tile texels per px
+    float h0 = paperTap(P, max(0.0, log2(0.5 * uU * tpp)), m).r;
+    float hor = 0.0;
+    for (int k = 1; k <= 3; k++) {
+      float d = float(k * k) * 0.5 * uU;               // px: 0.1, 0.4, 0.9 mm
+      float hk = paperTap(P - dir * d, max(0.0, log2(0.5 * d * tpp)), m).r;
+      hor = max(hor, (hk - h0) / float(k * k) - 0.012 / gk);
+    }
+    castSh = rake * uRelief * smoothstep(0.0, 0.05, hor) * 0.12;
+  }
+  // The light's own falloff across the sheet: gentle from the window, stronger from a low lamp,
+  // none from straight above (a scan is even).
+  float fall = dot(pu - 0.5, -dir) * 0.016 * min(gk, 2.5);
+  shade = 1.0 + s + fall - castSh;
 
   // Formation: cloudy flocs from ~20 mm down to ~2.5 mm (the octave weights give the ~20 mm and
   // ~5 mm floc sizes), with a faint warm/cool drift at ~50 mm.
-  float form = cloudW(pu * 9.0 + 5.0, vec4(0.533, 0.267, 0.347, 0.173));
-  float drift = cloudW(pu * 4.0 + 11.0, vec4(0.533, 0.267, 0.0, 0.0));
+  float form = cloudW(pm * 9.0 + 5.0, vec4(0.533, 0.267, 0.347, 0.173));
+  float drift = cloudW(pm * 4.0 + 11.0, vec4(0.533, 0.267, 0.0, 0.0));
   vec3 paper = uPaperColor * (1.0 + form * uMottle + vec3(0.25, 0.0, -0.25) * drift * uMottle);
   paper *= 1.0 + (t.a - 0.5) * 0.5;                   // strands: lighter or darker fibres
   paper = mix(paper, uSpeckColor, t.b * 0.9);
@@ -434,8 +528,14 @@ vec3 paperSurface(vec2 P, out float shade) {
   }
   // Satin sheen from the window on dark sheets (additive: specular does not scale with albedo).
   float dark = 1.0 - smoothstep(0.1, 0.5, dot(uPaperColor, vec3(0.2126, 0.7152, 0.0722)));
-  vec2 sh = pu - vec2(0.15, 0.05);
+  // (the sheen sits where the sheet mirrors the lamp into a camera above: toward the window light,
+  // at the centre for an overhead one, off the sheet for a raking one)
+  vec2 sh = pu - (0.5 - dir * 0.57 * gk);
   paper += dark * 0.02 * exp(-dot(sh, sh) * 1.8);
+  // On a dark sheet the diffuse shading vanishes into the dark albedo; what shows its grain is the
+  // surface's own reflection (a few percent whatever the colour), stronger on facets tipped toward
+  // the light. Linear in the relief response, so the mean tone stays.
+  paper += dark * 0.4 * s;
   // Soft knee so lit dome tops and light fibres never clip to pure white (paper * shade < 0.99).
   vec3 lit3 = paper * shade;
   vec3 k = 0.963 + 0.026 * (1.0 - exp(-max(lit3 - 0.963, 0.0) / 0.026));

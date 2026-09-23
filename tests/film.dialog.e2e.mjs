@@ -31,9 +31,10 @@ async function boot() {
 async function openTimed(page) {
   const t0 = Date.now();
   await page.evaluate(() => { window.__filmPreview = null; SP.openFilm(); });
-  await page.waitForFunction(() => window.__filmPreview, null, { timeout: 30000, polling: 16 });
+  // 90 s: the GPU box is shared, and a busy one delayed the first preview past 30 s (a flake, not a bug)
+  await page.waitForFunction(() => window.__filmPreview, null, { timeout: 90000, polling: 16 });
   const first = await page.evaluate(() => window.__filmPreview.firstFrameMs);
-  await page.waitForFunction(() => window.__filmPreview.stage() === 'full', null, { timeout: 30000, polling: 16 });
+  await page.waitForFunction(() => window.__filmPreview.stage() === 'full', null, { timeout: 90000, polling: 16 });
   return { first, full: Date.now() - t0 };
 }
 
@@ -112,6 +113,45 @@ for (let k = 0; k < runs; k++) {
   }
 }
 console.log(`cold open (median of ${runs}): first frame ${median(cold.map(c => c.first))} ms, desk fully baked ${median(cold.map(c => c.full))} ms  [${cold.map(c => `${c.first}/${c.full}`).join(', ')}]`);
+
+// 7. Realistic mode ("true drawing, sped up"): the hand-time estimate and the speed-up show, the
+// photo reveal and the pace / start choices go (the hand's own clock and order), the drawing clock
+// can be turned off, and a long drawing defaults to 60 s until a length is picked by hand.
+{
+  const page = await boot();
+  const hasReal = await page.evaluate(() => typeof SP.setMode === 'function');
+  if (!hasReal) console.log('skip  realistic dialog: the app has no realistic mode');
+  else {
+    await page.evaluate(() => { SP.prefs.film.lengthChosen = false; SP.prefs.film.length = 15; SP.setMode('realistic'); SP.setRealStyle('stipple'); });
+    await page.waitForFunction(() => SP.geom?.real?.style === 'stipple' && !SP.building, null, { timeout: 90000, polling: 250 });
+    await openTimed(page);
+    const r = await page.evaluate(() => {
+      const vis = id => { const el = document.getElementById(id); return !!el && !el.hidden && el.offsetParent !== null; };
+      const len = document.querySelector('#filmDialog [data-film="length"] [aria-checked="true"]')?.dataset.v;
+      return { hand: document.getElementById('filmHand').textContent, handVis: vis('filmHand'), reveal: vis('filmRevealRow'),
+        more: vis('filmMore'), counter: vis('filmCounterRow'), counterOn: document.querySelector('[data-film="counter"]').checked,
+        len, go: document.getElementById('filmGoLabel').textContent, secs: SP.geom.real.handSeconds };
+    });
+    check(r.handVis && /^About .+ of drawing by hand · shown (about [\d.]+× faster|at real speed) in \d+ s$/.test(r.hand), `hand-time line: "${r.hand}"`);
+    check(!r.reveal && !r.more && r.counter && r.counterOn, `reveal and pace hidden, clock shown and on (${JSON.stringify({ reveal: r.reveal, more: r.more, counter: r.counter, on: r.counterOn })})`);
+    const want = r.secs >= 1800 ? '60' : '15';
+    check(r.len === want && r.go.includes(`${want}-second`), `length ${r.len} s for ${Math.round(r.secs / 60)} min of drawing (${r.go})`);
+    await page.click('#filmDialog [data-film="length"] [data-v="30"]');
+    const picked = await page.evaluate(() => ({ len: SP.prefs.film.length, chosen: SP.prefs.film.lengthChosen, hand: document.getElementById('filmHand').textContent }));
+    check(picked.len === 30 && picked.chosen && picked.hand.endsWith('in 30 s'), `a length picked by hand is kept (${picked.hand})`);
+    await page.locator('#filmDialog').screenshot({ path: 'shots/rf_dialog_realistic.png' });
+    // back to Artistic: everything returns
+    await page.click('#filmClose');
+    await page.evaluate(() => SP.setMode('artistic'));
+    await page.waitForFunction(() => !SP.geom?.real && !SP.building, null, { timeout: 60000, polling: 250 });
+    await openTimed(page);
+    const a = await page.evaluate(() => ({ hand: !document.getElementById('filmHand').hidden, reveal: !document.getElementById('filmRevealRow').hidden,
+      counter: !document.getElementById('filmCounterRow').hidden }));
+    check(!a.hand && a.reveal && !a.counter, `artistic: no hand line, reveal back, no clock row (${JSON.stringify(a)})`);
+    await page.evaluate(() => { SP.prefs.film.length = 15; SP.prefs.film.lengthChosen = false; SP.persist?.(); });
+  }
+  await page.close();
+}
 if (logs.length) { console.log(logs.slice(0, 20).join('\n')); failures += logs.filter(l => l.includes('pageerror')).length; }
 await browser.close();
 if (failures) { console.log(`\n${failures} failing`); process.exit(1); }

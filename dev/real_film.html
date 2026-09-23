@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Realistic film lab</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap">
+<style>body{margin:0;background:#bbb;font:12px system-ui}</style>
+</head>
+<body>
+<!-- the counter's faces, so the canvas can use them -->
+<span style="font:500 12px Geist;position:absolute;opacity:0">0</span>
+<span style="font:italic 12px 'Instrument Serif';position:absolute;opacity:0">0</span>
+<script type="module">
+  // the counter's typefaces must be loaded before a frame is drawn with them
+  try { await Promise.race([Promise.all([document.fonts.load('500 20px Geist'), document.fonts.load('italic 20px "Instrument Serif"')]), new Promise(r => setTimeout(r, 3000))]); } catch { /* offline */ }
+  await import('./real_film.js');
+</script>
+</body>
+</html>

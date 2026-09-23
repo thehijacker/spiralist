@@ -611,6 +611,10 @@ async function renderAndEncode(state, { size, transparent = false, onProgress, s
     r.setPaper(state.paper, state.seed ?? 1);
     r.setStyle(state);
     r.setTransparent(transparent);
+    // Realistic mode: the paper keeps its real millimetre grain on a big sheet, under the chosen
+    // light (both absent in Artistic mode: today's virtual sheet and window light)
+    if (state.sheetMm && typeof r.setSheetMm === 'function') r.setSheetMm(state.sheetMm);
+    if (state.light) r.setLight(state.light);
     if (state.geom) r.setGeometry(state.geom);
     mark('setup');
 
@@ -1113,6 +1117,13 @@ const mm = v => +v.toFixed(3);
  */
 export function buildSVG(geom, { mode, ink = '#17171a', paper = null, sizeMm = SHEET_MM, layout = DEFAULT_LAYOUT, penMm } = {}) {
   if (!geom || geom.n < 2) throw new Error('buildSVG: no line to export');
+  // A realistic drawing IS a plotter file: the real sheet in mm, one path, the real pen width
+  // (whatever kind the dialog asks for, an outline or a fill would misstate the pen)
+  const real = geom.real && geom.real.toolMm > 0 && geom.real.sheetMm > 0 ? geom.real : null;
+  if (real) { mode = 'stroke'; sizeMm = real.sheetMm; penMm = real.toolMm; }
+  // the Save dialog names the file right after this call with the kind it asked for; remember the
+  // real sheet so fileName says what the file is ('...-real-594mm.svg', not '-outline.svg')
+  lastRealSvg = real ? { sheetMm: real.sheetMm, at: Date.now() } : null;
   mode = mode || (geom.technique === 'wave' ? 'stroke' : 'outline');
   if (!['stroke', 'outline', 'plotter'].includes(mode)) throw new Error('buildSVG: unknown mode ' + mode);
   const S = Math.max(1, +sizeMm || SHEET_MM);
@@ -1134,7 +1145,8 @@ export function buildSVG(geom, { mode, ink = '#17171a', paper = null, sizeMm = S
 
   const lengthM = (geom.length || 0) * m.R / 1000;
   const kind = geom.path || 'spiral';
-  const what = kind === 'spiral' ? `spiral of ${Math.round(geom.turns ?? geom.rings ?? 0)} turns`
+  const what = real ? `line, ${String(real.name || real.style || 'drawing').toLowerCase()} for a ${mm(real.toolMm)} mm pen (about ${Math.max(1, Math.round((real.handSeconds || 0) / 60))} min by hand)`
+    : kind === 'spiral' ? `spiral of ${Math.round(geom.turns ?? geom.rings ?? 0)} turns`
     : kind === 'maze' ? `line winding through a ${geom.shape === 'circle' ? 'round' : 'square'} maze ${Math.round(geom.rings ?? 0)} corridors across`
     : kind === 'wander' ? 'line wandering across the picture'
     : kind === 'contour' ? 'line tracing the outlines of the picture'
@@ -1257,7 +1269,14 @@ export async function copyPNG(blobPromise) {
 const COMBINING_MARKS = new RegExp('[\\u0300-\\u036f]', 'g');
 
 /** 'spiralist-portrait-pencil-4096.png' from ['Portrait', 'Pencil', 4096] and 'png'. */
+let lastRealSvg = null;
 export function fileName(parts = [], ext = '') {
+  parts = [].concat(parts);
+  // a realistic SVG was just built: its kind is always a real-size single stroke (see buildSVG)
+  if (lastRealSvg && String(ext).replace(/^\.+/, '').toLowerCase() === 'svg' && Date.now() - lastRealSvg.at < 5000
+    && ['stroke', 'outline', 'plotter'].includes(parts[parts.length - 1])) {
+    parts = [...parts.slice(0, -1), 'real', `${Math.round(lastRealSvg.sheetMm)}mm`];
+  }
   const slug = s => String(s ?? '').normalize('NFKD').replace(COMBINING_MARKS, '').toLowerCase()
     .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
   const bits = [].concat(parts).map(slug).filter(Boolean);

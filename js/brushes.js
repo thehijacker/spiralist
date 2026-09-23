@@ -99,6 +99,9 @@ export function brushWet(b) {
 //   st.curv  signed curvature of the line here, 1 / paper unit (+ = turning from +x toward +y, i.e.
 //            clockwise on the sheet; 1 / radius of the bend). Brushes swell and pool on tight bends.
 //   st.dir   unit direction of travel, paper px axes (x right, y down): nib angle, drag direction
+//   feedAt() how far the pen's ink feed has fallen behind on this segment, 0 (full) .. 1 (dry),
+//            typically 0.15-0.35: it drains over a long, heavy run and catches up where the hand
+//            slows or lingers (wetsim.js feedDeficit, integrated along the line; the varying vFeed)
 // Surface written through `sf` (the renderer MAX-blends it into its surface target; all 0..1):
 //   sf.groove indentation of the sheet (1 = 0.05 mm): ballpoint ball, pencil pressure, nib, grit
 //   sf.raised material standing on the sheet (1 = 0.05 mm): wax, chalk powder, metal paint / leaf
@@ -186,6 +189,9 @@ vec3 segFrame(Stroke st) {
 }
 
 // ---- wet-media helpers (fineliner, fountain, sumi, marker, watercolour)
+// The pen's feed deficit on this segment (FRAG_STROKE's vFeed: points i, i+1; it changes over
+// centimetres, so the segment's mean is exact enough and needs no position along it).
+float feedAt() { return clamp(0.5 * (vFeed.x + vFeed.y), 0.0, 1.0); }
 // Four 8-bit hashes of an integer cell and a salt.
 vec4 h4(vec2 c, float salt) {
   uint h = hashU(uvec2(ivec2(floor(c)) + 8192) + uvec2(uint(salt) * 7919u, uint(salt) * 3571u + 17u));
@@ -310,8 +316,12 @@ float brushDeposit(int brush, Stroke st, inout vec3 ink, out Surface sf) {
     float bend = smoothstep(0.04, 0.3, abs(st.curv));
     vec2 sg = vP1 - vP0;
     float narrow = smoothstep(0.03, 0.2, (vW.x - vW.y) * inversesqrt(max(dot(sg, sg), 1e-6)));
+    // The feed meters ink at a limited rate from a small reserve behind the nib: a long, heavy run
+    // draws it down (the line pales over 15-25 mm) and it catches up where the hand slows or lingers
+    // (st.feed, integrated along the line; centred on its typical 0.25, so the mean tone holds).
+    float fed = 0.8 * (feedAt() - 0.25);
     float dens = 0.5 + 0.36 * smoothstep(0.05, 0.9, tone) + 0.05 * slow + 0.62 * (f1.x - 0.5) + 0.34 * (f2.x - 0.5)
-               + 0.04 * pull + 0.2 * bend + 0.3 * narrow;
+               + 0.04 * pull + 0.2 * bend + 0.3 * narrow - fed;
     // a gently wandering edge: the nib's tipping skates over the tooth
     vec2 wob = vnA(vec2(sU / 3.0, side * 5.0 + sd0), 3.0 * uU);
     float hwF = hw + (wob.x - 0.5) * 0.22 * min(hw, uU);
@@ -339,9 +349,11 @@ float brushDeposit(int brush, Stroke st, inout vec3 ink, out Surface sf) {
     // A hair keeps its paper length at every size; the renderer fades sub-pixel lines by their
     // true width (thin), so the hairs are divided by it here and keep their ink at preview size.
     // Many fine hairs per millimetre: a preview shows their average as a soft, fibrous fringe.
+    // (Only for photo-coloured ink now: otherwise the composite walks the simulated ink out along
+    // the sheet's own fibres (wetsim.js WET_FIBRE_GLSL), which it cannot tint from the photo.)
     float fk = featherPaper();
     float hairK = 0.0;
-    if (uPass == 0 && fk > 0.0 && uCover == 0) {
+    if (uPass == 0 && fk > 0.0 && uCover == 0 && uPhotoColor == 1) {
       float reachU = fk * (2.0 + 3.0 * smoothstep(0.1, 0.9, tone)) * (1.0 + 0.15 * slow) * (0.8 + 0.4 * f1.x);
       reachU = min(reachU, ((uSpread - 1.0) * hw + 0.3) / uU);   // stay inside the stroke's reach
       float thin = clamp(st.hU * uU / hw, 0.05, 1.0);
@@ -362,7 +374,7 @@ float brushDeposit(int brush, Stroke st, inout vec3 ink, out Surface sf) {
     float tines = mix(0.5, 0.5 + 0.5 * cos(3.1416 * clamp(st.v * 2.0, 0.0, 2.0)), aa(hw));
     sf.groove = 0.14 * tone * st.cov * tines;
     sf.sheen = min(a, 1.0) * (0.04 + 0.1 * rimShare) * c2;
-    sf.wet = 0.45 + 0.5 * clamp(dens, 0.3, 1.5);
+    sf.wet = (0.45 + 0.5 * clamp(dens, 0.3, 1.5)) * (1.0 - 0.5 * fed);
   } else if (brush == 3) {            // sumi: soot in animal glue, laid by a soft hair brush
     // The brush's load along the line. The painter re-dips once in every ~150 mm of line, at a random
     // point of it (dips 30-270 mm apart, never in step from ring to ring). A freshly dipped brush
@@ -601,9 +613,21 @@ vec2 dryNoise(vec2 p, float cellPx) {
 // in the segment's own frame, pU paper units across and aspect times longer along, shown down to
 // ~1-px cells like dryNoise (a preview keeps its drag texture, correlated along the stroke).
 // Returns (value, hidden spread).
+// Value noise is not stationary across its lattice: on a lattice line it has its full spread, half
+// way between two it is an average of them with only ~0.71 of it. Across a stroke those lines sit
+// at fixed offsets from the centre line all along it (a 0.5 mm lead is two streak cells wide), so
+// thresholding the streaks against a deposit level made bands parallel to the line: dark rails at
+// the edges around a paler core. The across interpolation's own spread is divided out (scaled to
+// the mean spread over a cell, so tone and the hidden spread below stay as they were).
 vec2 dryStreak(float sU, float across, float pU, float aspect, float salt) {
   float k = clamp(pU * uU - 0.5, 0.0, 1.0);
-  return vec2(mix(0.5, vnoise(vec2(sU / (aspect * pU) + salt, across / pU + 0.37 * salt)), k), 0.214 * sqrt(1.0 - k * k));
+  // (the rows also drift slowly across the line along its length, as the tool turns in the hand,
+  // so no row keeps one offset from the centre line for the whole drawing)
+  float ya = across / pU + 0.37 * salt + 2.0 * vnoise(vec2(sU / (3.0 * aspect * pU) + 0.61 * salt, 7.3));
+  float fa = fract(ya), wa = fa * fa * (3.0 - 2.0 * fa);
+  float nrmA = 0.862 * inversesqrt(1.0 - 2.0 * wa + 2.0 * wa * wa);
+  float v = 0.5 + (vnoise(vec2(sU / (aspect * pU) + salt, ya)) - 0.5) * nrmA;
+  return vec2(mix(0.5, v, k), 0.214 * sqrt(1.0 - k * k));
 }
 vec4 dryHash4(vec2 c, float salt) {
   uint h = hashU(uvec2(ivec2(floor(c)) + 16384) + uvec2(uint(salt) * 2654435u + 7u, uint(salt) * 40503u + 101u));
@@ -722,8 +746,13 @@ float dryPencil(Stroke st, inout vec3 ink, inout Surface sf) {
   // the lead's rim meets the tooth tops first: a ragged edge at the grain's own scale
   float lead = edgeCov(hw * (1.0 + 0.1 * rel * aa(hw * 2.0)), st.dist, 0.45 * uU);
   float a = lead * fill;
-  // hard pressure dents the sheet under the lead; packed flakes on the flattened tops shine
-  sf.groove = 0.35 * press * press * lead;
+  // hard pressure dents the sheet under the lead; packed flakes on the flattened tops shine.
+  // The lead's tip is round, so the dent is a shallow rounded trough, deepest on the centre line:
+  // a flat-bottomed dent put all its slope in two walls at the rim, which the light turned into a
+  // pair of dark and bright rails around a paler core (an outlined tube, not a pencil line).
+  // (st.dist / hw: the drawn width, so a line widened to 1 px keeps its dent's mean depth)
+  float rr = clamp(st.dist / max(hw, 1e-3), 0.0, 1.0);
+  sf.groove = 0.3 * press * press * lead * (1.0 - rr * rr);
   sf.sheen = lead * dep * (0.2 + 0.8 * press * press);
   // burnished graphite: where it is packed hard, patches of the sheet turn silvery. Graphite only:
   // coloured leads and photo colours are wax-bound and never shine so.
@@ -751,10 +780,21 @@ float dryCharcoal(Stroke st, inout vec3 ink, inout Surface sf) {
   vec2 rag = vnA(vec2(sU / rc, st.side * 5.0 + sd0), rc * uU);
   vec2 rag2 = vnA(vec2(sU / (0.3 * rc), st.side * 7.0 + sd0 + 2.0), 0.3 * rc * uU);
   float hwE = hw * (0.88 + 0.2 * rag.x + 0.12 * (rag2.x - 0.5));
-  float core = edgeCov(hwE, dist, 0.5 * uU);
+  vec4 g = dryGrain(st.P, 2.4, 1.2, s);
+  // The rim breaks along the tooth: toward the edge the stick only grazes, so only the peaks take
+  // carbon and the valleys stay paper (the threshold climbs from a sigma below the local mean
+  // inside to two above at the rim). A smooth edge plus a soft halo read as an airbrushed tube.
+  float edgeT = smoothstep(0.62, 1.1, dist / max(hwE, 1e-3));
+  float peaks = over(g.x, g.y, g.z + (2.2 * edgeT - 1.0) * g.w, 0.02);
+  float core = edgeCov(hwE * 1.1, dist, 0.5 * uU) * mix(1.0, peaks, edgeT);
+  // Carbon is a neutral, faintly cool black: the vine and compressed blacks (near-neutral, dark)
+  // lose the warm cast that read brown-olive over a cream sheet. Sanguine and white keep theirs.
+  if (uPhotoColor == 0) {
+    float chroma = max(ink.r, max(ink.g, ink.b)) - min(ink.r, min(ink.g, ink.b));
+    if (chroma < 0.06 && lum3(ink) < 0.25) ink = mix(ink, vec3(lum3(ink)) * vec3(0.96, 0.99, 1.06), 0.85);
+  }
   // pressure: the photo's darkness, lighter toward the stick's flank (its mean where unresolved)
   float press = tone * mix(0.85, 1.0 - 0.5 * smoothstep(0.4, 1.0, st.v), aa(hw * 2.0));
-  vec4 g = dryGrain(st.P, 2.4, 1.2, s);
   float body = 0.0;
   vec2 gr = vec2(0.0);
   float bite = smoothstep(0.3, 0.8, tone);
@@ -775,17 +815,23 @@ float dryCharcoal(Stroke st, inout vec3 ink, inout Surface sf) {
     body = body * (1.0 - 0.75 * bite * gr.x) + (1.0 - body) * 0.6 * bite * gr.y;
   }
   float a = core * body;
-  // dust: a thin veil on the tooth tops around the stroke, clouded, denser where it is dark ...
-  float hW = 1.3 * hw;
+  // The dust falls where the stick's flank rubbed: a right hand tilts the stick toward the lower
+  // right of the sheet (paper px: y down), so that side of every stroke gets a sparse veil and the
+  // crumbs, the other side almost none. A halo even on both sides read as airbrush glow.
+  vec2 nrm = vec2(-st.dir.y, st.dir.x) * (fr.y >= 0.0 ? 1.0 : -1.0);
+  float flank = smoothstep(-0.3, 0.6, dot(nrm, vec2(0.6, 0.8)));
+  // dust: a thin veil on the tooth tops beside the stroke, clouded, denser where it is dark ...
+  float hW = (0.5 + 0.5 * flank) * hw;
   float ring = max(0.0, edgeCov(hwE + 0.5 * hW, dist, hW) - core);
   float mc = max(6.0, 1.2 * hU);
   if (ring > 0.0) {
     vec2 sm = vnA(st.P / uU / mc + sd0 + 37.0, mc * uU);
-    a += ring * (0.04 + 0.26 * tone * tone) * (0.2 + 1.6 * sm.x) * (0.4 + 1.2 * over(g.x, g.y, g.z + 0.3 * g.w, 0.02));
+    a += ring * (0.02 + 0.13 * tone * tone) * mix(0.15, 0.7, flank) * (0.2 + 1.6 * sm.x)
+       * (0.2 + 1.6 * over(g.x, g.y, g.z + 0.5 * g.w, 0.02));
   }
   // ... and loose specks strewn beside it: flat, irregular crumbs of the stick, as black and
   // matte as the stroke itself (they lie on the sheet: no relief of their own)
-  vec2 pt = dryParticles(st.P, hw, 1.3, sd0 + 5.0, 0.3, 0.04 + 0.2 * tone, 1.0, uSpread - 0.4, 0.0);
+  vec2 pt = dryParticles(st.P, hw, 1.3, sd0 + 5.0, 0.3, (0.03 + 0.14 * tone) * mix(0.2, 1.0, flank), 1.0, uSpread - 0.4, 0.0);
   a = max(a, pt.x * (0.62 + 0.3 * pt.y));
   // powder stands on the sheet; the scrapes are dented into it (shallow: they read under a raking
   // light, not as a lit gutter)
@@ -821,15 +867,26 @@ float dryCrayon(Stroke st, inout vec3 ink, inout Surface sf) {
   vec2 dash = vnA(vec2(sU / Ld + sd0 + 9.0, 2.5), Ld * uU);
   float thinK = 1.0 - smoothstep(0.8, 3.0, hUT);
   float touch = mix(0.25, 1.0, overV(dash.x, 0.0, dash.y, thinK * (0.62 - 0.6 * tone), 0.03));
-  float press = tone * touch;
+  // A broad tip spreads the same hand force over more paper (a 4 mm stick has some 16x the contact
+  // of a sharpened point), so it presses less per area and rides the tooth tops: the paper's pits
+  // show through as a fine white speckle, the way a real crayon's side stroke looks. Only strokes
+  // wider than ~2.5 mm feel it.
+  float broad = smoothstep(6.0, 14.0, hUT);
+  float press = tone * touch * (1.0 - 0.4 * broad);
   // Wax on the tooth tops and raised fibres it reaches, dragged into striations; pressure smears
   // it down into the valleys (a heavy hand leaves a nearly solid, waxy layer), and the tooth's
   // own pits stay paper longest.
-  float m = 0.42 * g.x + 0.33 * sk.x + 0.25 * sk2.x;
-  float wax = overV(m, 0.42 * g.y, length(vec2(0.33 * sk.y, 0.25 * sk2.y)), 0.62 - 0.42 * press, 0.02);
-  float pit = 1.0 - over(g.x, g.y, g.z - 0.8 * g.w, 0.01);
+  // Skip over the tooth is crayon's signature at every width and pressure: the wax film is too
+  // stiff to follow the paper down, so the tooth decides most of where it lands (a larger weight
+  // than the striations) and the valleys below the tops the tip rides stay paper, a heavy hand
+  // only lowering that line a little. (Most of the skip goes through this one threshold, whose
+  // hidden spread keeps previews and exports on the same tone; a second, correlated threshold
+  // multiplied in would not average the same.)
+  float m = 0.55 * g.x + 0.27 * sk.x + 0.18 * sk2.x;
+  float wax = overV(m, 0.55 * g.y, length(vec2(0.27 * sk.y, 0.18 * sk2.y)), 0.66 - 0.42 * press, 0.02);
+  float pit = 1.0 - over(g.x, g.y, g.z - (0.55 + 0.45 * press) * g.w, 0.02);
   // (the layer is thicker along the striations the tip drags: zero mean, shown up close)
-  wax *= (1.0 - 0.7 * pit * (1.0 - 0.6 * press)) * (1.0 + 0.3 * (sk.x - 0.5) + 0.5 * (sk2.x - 0.5));
+  wax *= (1.0 - 0.5 * pit) * (1.0 + 0.3 * (sk.x - 0.5) + 0.5 * (sk2.x - 0.5));
   wax *= mix(1.0 - 0.25 * 0.225, 1.0 - 0.25 * smoothstep(0.55, 1.0, st.v), aa(hw * 2.0));
   float a = edge * min(wax * (0.66 + 0.34 * touch), 0.97);
   // crumbs: where the line turns hard (a maze corner, a wander's hairpin) or the tip lingers,
@@ -842,8 +899,14 @@ float dryCrayon(Stroke st, inout vec3 ink, inout Surface sf) {
   // it casts no bevel grain by grain: only the stroke as a whole stands a little proud (a bevel at
   // the wax/paper boundary, its ragged edge), a crumb more. It shines where pressure smeared it
   // flat.
-  sf.raised = 0.45 * edge * (0.4 + 0.6 * press) + 0.5 * crumb;
-  sf.sheen = a * (0.3 + 0.5 * press);
+  // (the wax thins out toward its ragged edge over ~0.1 mm instead of stepping up within a pixel:
+  // up close a one-texel step read as a cut-paper outline; at preview size it is the same step)
+  // Crayon wax is a matte film tens of microns thick: it stands barely proud of the sheet and has
+  // only a faint satin where pressure smeared it flat. A thick bevel and a broad gloss made it
+  // read as icing or extruded gel under the loupe.
+  float edgeR = clamp((hwE - dist) / max(1.0, 0.5 * uU) + 0.5, 0.0, 1.0);
+  sf.raised = 0.07 * edgeR * edge * (0.4 + 0.6 * press) + 0.25 * crumb;
+  sf.sheen = a * (0.04 + 0.1 * press);
   return a;
 }
 

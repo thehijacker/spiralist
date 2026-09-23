@@ -107,11 +107,14 @@ test('surface samplings match grainAt (relief lines up with the grain brushes re
   const shaders = readFileSync(new URL('../js/shaders.js', import.meta.url), 'utf8');
   const grain = shaders.slice(shaders.indexOf('vec3 grainAt('), shaders.indexOf('float above('));
   const uv2 = grain.match(/vec2 uv2 = (mat2\([^)]*\)) \* \(P \/ \(uTilePx \* ([0-9.]+)\)\) \+ (vec2\([^)]*\));/);
-  const mask = grain.match(/float m = smoothstep\(([^,]+), ([^,]+), vnoise\(P \/ uPaperPx \* ([0-9.]+) \+ ([0-9.]+)\)\);/);
+  // (the mask is in physical units since renderer.setSheetMm: P / uPhysPx in grainAt, pm in the
+  // surface; both equal the sheet units on the default 210 mm sheet)
+  const mask = grain.match(/float m = smoothstep\(([^,]+), ([^,]+), vnoise\(P \/ (uPaperPx|uPhysPx) \* ([0-9.]+) \+ ([0-9.]+)\)\);/);
   assert.ok(uv2 && mask, 'grainAt no longer has the expected shape: update paperTaps() and this test');
   const surf = PAPER_SURFACE_GLSL.replace(/\s+/g, ' ');
   assert.ok(surf.includes(`${uv2[1]} * (P / (uTilePx * ${uv2[2]})) + ${uv2[3]}`), 'second sampling differs from grainAt');
-  assert.ok(surf.includes(`vnoise(pu * ${mask[3]} + ${mask[4]})`), 'blend mask noise differs from grainAt');
+  const unit = mask[3] === 'uPhysPx' ? 'pm' : 'pu';
+  assert.ok(surf.includes(`vnoise(${unit} * ${mask[4]} + ${mask[5]})`), 'blend mask noise differs from grainAt');
   assert.ok(surf.includes(`smoothstep(${mask[1]}, ${mask[2]}, mv)`), 'blend mask ramp differs from grainAt');
 });
 

@@ -11,14 +11,18 @@ import { rasterize, processTone, buildField, TONE_DEFAULTS, CROP_DEFAULTS, cropD
 import { buildSpiral, LINE_DEFAULTS, indexAt, headAt, printedLength, previewStroke, STRIDE } from './spiral.js';
 import { buildMaze } from './maze.js';
 import { buildWander, buildContour, FREE_DEFAULTS } from './freeline.js';
-import { BRUSHES, PAPERS, LOOKS, brushById, paperById, lookById, inkMode, hexToRgb, luminance, contrastRatio, SHEET_MM } from './materials.js';
+import { BRUSHES, PAPERS, LOOKS, brushById, paperById, lookById, inkMode, hexToRgb, luminance, contrastRatio, SHEET_MM, REAL_TOOLS, realToolFor } from './materials.js';
+import { lightById } from './papers.js';
+import { REAL_STYLES, SHEETS, realStyleById, autoSheet, sheetFit, fitManualSheet, realFieldRings, formatHand, formatMm, formatSheet, LAYOUT_R } from './real/index.js';
+import { RealBuilder } from './real/builder.js';
 import { decodeImage, fromDrawable, autoCrop, encodeForStorage, imageErrorMessage, makeCanvas } from './imageio.js';
 import { loadSettings, saveSettings, clearSettings, savePhoto, loadPhoto, forgetPhoto } from './store.js';
 import { History } from './history.js';
 import { sliderRow, bindSeg, rovingGrid, setChecked, popover, toast, announce, fmtTime, reducedMotion, isTouch, paintRange } from './ui.js';
 import { Thumbs } from './thumbs.js';
-import { drawSeconds, drawProgress, signSeconds, warmFilm } from './film.js';
+import { drawSeconds, drawProgress, signSeconds, warmFilm, filmLengthFor } from './film.js';
 import { starCount } from './share.js';
+import { Loupe } from './loupe.js';
 
 const $ = id => document.getElementById(id);
 const LAYOUT = Object.freeze({ cx: 0.5, cy: 0.5, r: 0.42 });
@@ -31,6 +35,14 @@ const DEFAULT_DOC = {
   look: 'classic', brush: 'fineliner', ink: '#17171a', inkSource: 'swatch', paper: 'cream',
   line: { ...LINE_DEFAULTS, path: 'spiral' }, tone: { ...TONE_DEFAULTS }, crop: { ...CROP_DEFAULTS },
   free: { ...FREE_DEFAULTS },
+  // Realistic mode ("a real pen on a real sheet"): one fixed-width tool at its real size, shading
+  // only from line density. tool = a brush id (doc.brush follows it while the mode is on).
+  mode: 'artistic',
+  // paperChosen: the user picked a paper in Realistic mode, so a tool change keeps it (otherwise
+  // each tool starts on its own real sheet: chalk on a board, charcoal on cold-press)
+  real: { style: 'squiggle', preset: 'detailed', tool: 'fineliner', toolMm: 0.4, sheetMm: 210, sheetAuto: true, sheetPick: null, light: 'window', paperChosen: false },
+  // the other mode's materials (tool, ink, paper, tone detail), restored when switching back
+  stash: {},
 };
 const DEFAULT_PREFS = {
   theme: 'system', pacing: 'natural', speed: 1, showTool: true,
@@ -40,6 +52,8 @@ const DEFAULT_PREFS = {
 };
 applyLookTo(DEFAULT_DOC, lookById('classic'));
 
+// the last hand-picked sheet that had to shrink for the tool (see syncAutoSheet; mergeDoc uses it)
+let sheetSnap = null;
 const saved = loadSettings();
 let doc = mergeDoc(saved?.doc);
 let prefs = mergePrefs(saved?.prefs);
@@ -55,7 +69,33 @@ function mergeDoc(d) {
   if (!BRUSHES.some(b => b.id === out.brush)) out.brush = base.brush;
   if (!PAPERS.some(p => p.id === out.paper)) out.paper = base.paper;
   if (!/^#[0-9a-f]{6}$/i.test(out.ink)) out.ink = base.ink;
+  out.mode = out.mode === 'realistic' ? 'realistic' : 'artistic';
+  const r = out.real = { ...base.real, ...d.real };
+  if (!REAL_STYLES.some(s => s.id === r.style)) r.style = base.real.style;
+  if (!['quick', 'detailed', 'masterpiece'].includes(r.preset)) r.preset = 'detailed';
+  if (!REAL_TOOLS.some(t => t.brush === r.tool)) r.tool = base.real.tool;
+  if (!realToolFor(r.tool).sizes.includes(r.toolMm)) r.toolMm = realToolFor(r.tool).sizes[0];
+  if (!SHEETS.some(s => s.mm === r.sheetMm)) r.sheetAuto = true;
+  if (!['window', 'raking', 'overhead'].includes(r.light)) r.light = 'window';
+  r.paperChosen = !!r.paperChosen;
+  if (!SHEETS.some(s => s.mm === r.sheetPick)) r.sheetPick = null;
+  out.stash = d.stash && typeof d.stash === 'object' ? d.stash : {};
+  if (out.mode === 'realistic') { out.brush = r.tool; syncAutoSheet(out); }
   return out;
+}
+/**
+ * The auto sheet: the smallest standard size on which this tool can draw a face in this style. A
+ * sheet picked by hand that the new tool or style cannot fill (a fine pen on a 150 cm sheet picked
+ * for a stick: days of drawing, more line than a drawing holds) snaps to the largest that fits,
+ * and the Paper panel says so (sheetSnap, declared before the saved doc is merged).
+ */
+function syncAutoSheet(d) {
+  if (d.real.sheetAuto) { d.real.sheetMm = autoSheet(d.real.style, d.real.toolMm); return; }
+  // sheetPick = the sheet picked by hand: it comes back when a tool that can fill it returns
+  const want = d.real.sheetPick ?? d.real.sheetMm;
+  const to = fitManualSheet(d.real.style, d.real.toolMm, want);
+  if (to != null) sheetSnap = { from: want, to, toolMm: d.real.toolMm, tool: d.real.tool, style: d.real.style };
+  d.real.sheetMm = to ?? want;
 }
 function mergePrefs(p) {
   const base = structuredClone(DEFAULT_PREFS);
@@ -80,15 +120,19 @@ function applyLookTo(d, look) {
 }
 
 const brush = () => brushById(doc.brush);
+const realistic = () => doc.mode === 'realistic';
+/** The sheet's real width: the virtual sheet in Artistic mode, the chosen real sheet in Realistic. */
+const sheetMm = () => (realistic() ? doc.real.sheetMm : null);
 /** The outline of the drawing: the spiral and circle mazes are round, square mazes square. */
-const artShape = () => (doc.line.path !== 'spiral' && doc.free.shape === 'square' ? 'square' : 'circle');
+const artShape = () => (realistic() ? realStyleById(doc.real.style).shape
+  : doc.line.path !== 'spiral' && doc.free.shape === 'square' ? 'square' : 'circle');
 function clipArt(ctx, cx, cy, R, shape = artShape()) {
   ctx.beginPath();
   if (shape === 'square') ctx.rect(cx - R, cy - R, 2 * R, 2 * R);
   else ctx.arc(cx, cy, R, 0, Math.PI * 2);
 }
 const paper = () => paperById(doc.paper);
-const photoColor = () => doc.inkSource === 'photo';
+const photoColor = () => doc.inkSource === 'photo' && !realistic();
 const mode = () => inkMode(brush(), doc.ink, paper(), photoColor());
 const flip = () => mode().flip !== !!doc.tone.invert;
 
@@ -101,6 +145,7 @@ function keyOf(...parts) { return parts.map(p => (typeof p === 'object' ? JSON.s
 /** Build (or reuse) the geometry for the current doc. draft = lower-resolution field for live gestures. */
 function computeGeometry(draft = false) {
   if (!photo) return null;
+  if (realistic()) return computeRealGeometry(draft);
   const G = draft ? 512 : 1024;
   const rk = keyOf(photo.id, doc.crop, G);
   if (cache.rk !== rk) { cache.raster = rasterize(photo.canvas, doc.crop, G); cache.rk = rk; }
@@ -118,6 +163,79 @@ function computeGeometry(draft = false) {
   return cache.geom;
 }
 
+// Realistic builds run in a worker (js/real/builder.js): the stage keeps its last image and shows
+// "Drawing the line…" until the new geometry arrives, then tick() swaps it in.
+const realBuilder = new RealBuilder();
+// dirty: the doc changed and the next frame has not asked for its drawing yet (SP.building);
+// good: the doc of the last drawing that landed, restored if a newer build fails
+const realState = { key: '', want: '', geom: null, startedAt: 0, dirty: false, failed: '', good: null, draft: false };
+function realOpts(d = doc) {
+  const r = d.real;
+  return { toolMm: r.toolMm, sheetMm: r.sheetMm, preset: r.preset, tool: r.tool, seed: d.line.seed || 1 };
+}
+function computeRealGeometry(draft = false) {
+  // while a slider drags, a half-resolution field keeps the main thread's share (tone + field) short
+  // (384: tone + field then take ~25 ms a frame; the full build follows on release)
+  const G = draft ? 384 : 1024;
+  const rk = keyOf(photo.id, doc.crop, G);
+  if (cache.rk !== rk) { cache.raster = rasterize(photo.canvas, doc.crop, G); cache.rk = rk; }
+  const fl = flip();
+  const tk = keyOf(rk, doc.tone, fl);
+  if (cache.tk !== tk) { cache.tone = processTone(cache.raster, doc.tone, { flip: fl }); cache.tk = tk; }
+  const style = doc.real.style, opts = realOpts();
+  const rings = realFieldRings(style, opts);
+  const fk = keyOf(tk, rings);
+  if (cache.fk !== fk) { cache.field = buildField(cache.raster, cache.tone.L, { rings, flip: fl }); cache.fk = fk; }
+  const key = keyOf('real', fk, style, opts);
+  realState.dirty = false;
+  realState.draft = draft;
+  if (realState.key === key && realState.geom) return realState.geom;
+  if (realState.want !== key) {
+    realState.want = key;
+    realState.startedAt = performance.now();
+    const snap = { real: { ...doc.real }, brush: doc.brush, ink: doc.ink, inkSource: doc.inkSource, paper: doc.paper };
+    setBuilding(true);
+    realBuilder.build(style, cache.field, opts, { tag: 'stage', priority: true }).then(g => {
+      if (realState.want !== key) return;   // a newer build is on its way
+      setBuilding(false);
+      if (!g) { realBuildFailed(key); return; }
+      realState.key = key; realState.geom = g; realState.good = snap; realState.failed = '';
+      // a draft (slider drag) lands as a draft: asking for 'geom' here would redo tone and field
+      // at full size on the main thread for every landing, which is what made drags stutter
+      invalidate(realState.draft ? 'draft' : 'geom');
+    });
+  }
+  // meanwhile the stage keeps the last realistic drawing (never the other mode's)
+  return geom?.real ? geom : null;
+}
+/**
+ * A build that failed must not leave the stage showing the old drawing under the new tool's name:
+ * go back to the doc of the last drawing that landed (one undo step) and say why.
+ */
+function realBuildFailed(key) {
+  realState.failed = key;
+  const good = realState.good;
+  if (good && realistic()) {
+    toast('That drawing needs more line than one drawing can hold. Back to the last drawing — try a bigger tool or a smaller sheet.', { error: true });
+    change(d => { Object.assign(d, { brush: good.brush, ink: good.ink, inkSource: good.inkSource, paper: good.paper }); d.real = { ...good.real }; },
+      { label: 'Back to the last drawing', thumbs: true });
+  } else {
+    toast('This drawing could not be made. Try a bigger tool, a smaller sheet or less detail.', { error: true });
+    updateStat();
+  }
+}
+function setBuilding(on) {
+  const el = $('sheet');
+  clearTimeout(setBuilding.t);
+  if (!on) { el.classList.remove('building'); updateStat(); return; }
+  // only a build that takes a moment shows a label (most land within a frame or two)
+  setBuilding.t = setTimeout(() => {
+    el.dataset.building = 'Drawing the line…';
+    el.classList.add('building');
+    updateStat();
+  }, 160);
+}
+
 /** One entry point for every path shape. */
 function buildPath(path, field, line, free, opts = {}) {
   if (path === 'maze') return buildMaze(field, line, free, opts);
@@ -132,6 +250,9 @@ export function renderState(g = geom) {
   return {
     geom: g, brush: brush(), paper: paper(), ink: doc.ink, cover: m.cover, photoColor: photoColor(),
     layout: { ...LAYOUT }, seed: doc.line.seed || 1, shape: artShape(),
+    // Realistic mode: the real sheet (paper texture keeps its millimetre size) and the chosen light
+    mode: doc.mode, real: realistic() ? { ...doc.real } : null,
+    sheetMm: sheetMm(), light: realistic() ? lightById(doc.real.light) : null,
   };
 }
 
@@ -159,6 +280,21 @@ try {
 }
 const thumbs = new Thumbs();
 
+// The loupe: zoom into the sheet to see the medium at full density (js/loupe.js). Framing and
+// choosing a start point work on the whole sheet, so they fit it first.
+const loupe = new Loupe($('sheet'), {
+  ui: {
+    bar: $('loupeBar'), zoom: $('loupeZ'), rule: $('loupeRule'), mm: $('loupeMm'),
+    btnIn: $('loupeIn'), btnOut: $('loupeOut'), btnFit: $('loupeFit'), btnToggle: $('btnLoupe'),
+  },
+  sheetMm: () => (realistic() ? doc.real.sheetMm : SHEET_MM),
+  canZoom: () => !!photo && !framing.active && !picking.active,
+  onChange: () => invalidate('render'),
+  onGesture: () => clearTimeout(lpTimer),
+  announce: text => announce(text),
+  reducedMotion,
+});
+
 // ------------------------------------------------------------------------------------ playback
 const play = {
   f: 1,               // drawing progress 0..1 (transport position)
@@ -170,7 +306,12 @@ const play = {
   dryAt: 0,           // when playback reached the end: wet ink then dries on screen (DRY_MS)
 };
 // the drawing's share of the film: the transport previews exactly the film's pace
-const drawSec = () => drawSeconds(prefs.film.length, prefs.film.reveal, prefs.film.style, signSeconds(prefs.film.signature));
+// (Realistic: the film that the dialog makes: its own length for long drawings, never a reveal)
+const drawSec = () => (realistic() && geom?.real
+  ? drawSeconds(filmLengthFor(prefs.film, geom, true), false, prefs.film.style, signSeconds(prefs.film.signature))
+  : drawSeconds(prefs.film.length, prefs.film.reveal, prefs.film.style, signSeconds(prefs.film.signature)));
+/** Hand time reached at transport position f (Realistic drawings carry the hand clock). */
+const handAtF = f => geom.handT[Math.min(geom.n - 1, Math.floor(pointIndexFinite(f)))];
 // Wet ink dries over this long once the pen lifts, as in the film (a finished still is dry).
 const DRY_MS = 1600;
 function dryness(now) {
@@ -185,6 +326,8 @@ function pointIndex(f) {
   if (f >= 1) return Infinity;
   return indexAt(geom, drawProgress(f, drawSec()), prefs.pacing);
 }
+
+const pointIndexFinite = f => { const fi = pointIndex(f); return Number.isFinite(fi) ? fi : (geom ? geom.n - 1 : 0); };
 
 function setPlaying(on, { demo = false } = {}) {
   if (on && !photo) return;
@@ -223,7 +366,7 @@ function tick(now) {
     const draft = need.draft;
     need.geom = false; need.draft = false;
     const g = computeGeometry(draft);
-    if (g && g !== geom) { geom = g; renderer.setGeometry(geom); }
+    if (g !== geom && (g || realistic())) { geom = g; if (g) renderer.setGeometry(geom); }
     lastGeomMs = performance.now() - t0;
     if (!draft) { need.penSees = true; scheduleIdleWork(); }
     updateStat();
@@ -245,12 +388,17 @@ function tick(now) {
   const drying = play.dryAt > 0 && brush().wetness > 0;
   if (!compiling) {
     const upTo = pointIndex(play.f);
-    if (geom) renderer.render(upTo, upTo === Infinity ? { settle: dryness(now) } : undefined);
-    else renderer.renderBlank();
+    const opts = upTo === Infinity ? { settle: dryness(now) } : undefined;
+    if (geom && loupe.active) loupe.draw(renderer, upTo, opts, now);
+    else {
+      loupe.release(renderer);
+      if (geom) renderer.render(upTo, opts);
+      else renderer.renderBlank();
+    }
   }
   drawOverlay(now);
   updateTransport();
-  const animating = play.playing || drying || (play.lift < 1 && play.f >= 1 && prefs.showTool);
+  const animating = play.playing || drying || (play.lift < 1 && play.f >= 1 && prefs.showTool) || loupe.busy(now);
   if (animating || busy || compiling) rafId = requestAnimationFrame(tick);
   need.render = false;
 }
@@ -262,6 +410,11 @@ function applyRendererState() {
   renderer.setStyle({ brush: brush(), ink: doc.ink, cover: m.cover, photoColor: photoColor() });
   // wet ink spreads and dries with the pacing the transport plays
   renderer.setPacing(prefs.pacing);
+  // Realistic: grain, fibres and grit keep their real millimetre size on a big sheet; named light
+  const mm = sheetMm();
+  if (typeof renderer.setSheetMm === 'function' && applyRendererState.mm !== mm) { renderer.setSheetMm(mm); applyRendererState.mm = mm; }
+  const light = realistic() ? doc.real.light : '';
+  if (applyRendererState.light !== light) { renderer.setLight(light ? lightById(light) : undefined); applyRendererState.light = light; }
   $('sheet').style.background = paper().color;
 }
 
@@ -285,6 +438,7 @@ function layoutStage() {
   side = Math.floor(clamp(side, 220, 1100));
   sheetCss = side;
   document.documentElement.style.setProperty('--sheet', `${side}px`);
+  loupe.resize();
   const px = Math.round(Math.min(side * DPR(), mobile ? 2048 : 2600));
   if (renderer.s.width !== px) {
     renderer.setSize(px, px);
@@ -322,7 +476,8 @@ function sheetToOverlay(x, y) {
 
 function drawOverlay(now) {
   const W = overlay.width, S = W / (1 + 2 * OVER), o = OVER * S;
-  const full = framing.active || view.compare || view.penSees;
+  const zoomed = loupe.active;
+  const full = framing.active || view.compare || view.penSees || zoomed;
   if (full || drawOverlay.wasFull) {
     octx.clearRect(0, 0, W, W);
     lastToolBox = null;
@@ -352,6 +507,21 @@ function drawOverlay(now) {
     octx.restore();
     return;
   }
+  if (zoomed) {
+    // The loupe shows part of the sheet: the photo (compare / what the pen sees) is mapped the same
+    // way and cut at the sheet's edge. The tool sprite hides: at 10x it would cover the view.
+    play.lift = 1;
+    if (!(view.compare || view.penSees) || !photo) return;
+    const [vx, vy] = loupe.view(), z = loupe.z;
+    octx.save();
+    octx.beginPath(); octx.rect(o, o, S, S); octx.clip();
+    octx.setTransform(z, 0, 0, z, o * (1 - z) - z * vx * S, o * (1 - z) - z * vy * S);
+    clipArt(octx, cx, cy, R); octx.clip();
+    if (view.penSees && cache.field) drawFieldInCircle(octx, cx, cy, R);
+    else drawPhotoInCircle(octx, cx, cy, R);
+    octx.restore();
+    return;
+  }
   if ((view.compare || view.penSees) && photo) {
     octx.save();
     clipArt(octx, cx, cy, R); octx.clip();
@@ -362,7 +532,7 @@ function drawOverlay(now) {
   }
 
   // maze start point: crosshair while choosing, a pin that fades after a pick
-  if (doc.line.path !== 'spiral' && (picking.active || picking.flash > now)) {
+  if (!realistic() && doc.line.path !== 'spiral' && (picking.active || picking.flash > now)) {
     const px = picking.active && picking.hover ? picking.hover : [doc.free.x, doc.free.y];
     const [mx, my] = sheetToOverlay(px[0], px[1]);
     const a = picking.active ? 1 : Math.min(1, (picking.flash - now) / 600);
@@ -395,7 +565,10 @@ function drawOverlay(now) {
   const fi = pointIndex(Math.min(play.f, 0.99999));
   const h = headAt(geom, Number.isFinite(fi) ? fi : geom.n - 1);
   const [x, y] = sheetToOverlay(h.x, h.y);
-  const size = S * 0.28;
+  // Realistic: the tool at its real length on the real sheet (a 9 cm charcoal stick is small over a
+  // 1.5 m sheet); never longer than the Artistic sprite, which is already short for an A4 sheet
+  const realLen = { charcoal: 90, chalk: 80, crayon: 90, marker: 140, brush: 220, watercolour: 220 }[doc.brush] || 150;
+  const size = S * (realistic() ? clamp(realLen / doc.real.sheetMm, 0.05, 0.28) : 0.28);
   const lift = play.lift;
   const opts = {
     color: photoColor() ? '#8a5a44' : doc.ink,
@@ -468,7 +641,11 @@ function updateTransport() {
   if (!play.scrubbing) scrub.value = Math.round(play.f * 1000);
   paintRange(scrub);
   const total = drawSec();
-  $('time').textContent = `${fmtTime(play.f * total)} / ${fmtTime(total)}`;
+  // Realistic: the honest clock is the hand's ('13 min / 58 min'), not the film's 12 s
+  const hand = realistic() && geom?.real && geom.handT;
+  $('time').textContent = hand ? `${formatHand(handAtF(play.f))} / ${formatHand(geom.real.handSeconds)}`
+    : `${fmtTime(play.f * total)} / ${fmtTime(total)}`;
+  $('time').classList.toggle('hand', !!hand);
   const ring = geom ? Math.round(headRing()) : 0;
   scrub.setAttribute('aria-valuetext', `${fmtTime(play.f * total)} of ${fmtTime(total)}${geom ? `, ring ${ring} of ${geom.rings}` : ''}`);
   const btn = $('btnPlay');
@@ -492,7 +669,9 @@ scrub.addEventListener('input', () => {
   const tip = $('scrubTip');
   const total = drawSec();
   tip.hidden = false;
-  tip.textContent = geom && geom.path !== 'spiral'
+  tip.textContent = geom?.real && geom.handT
+    ? `${formatHand(handAtF(play.f))} of ${formatHand(geom.real.handSeconds)} by hand`
+    : geom && geom.path !== 'spiral'
     ? `${Math.round(play.f * 100)}% drawn · ${fmtTime(play.f * total)}`
     : `Ring ${Math.round(headRing())} of ${geom?.rings ?? 0} · ${fmtTime(play.f * total)}`;
   tip.style.left = `${play.f * 100}%`;
@@ -534,6 +713,7 @@ $('btnRedo').addEventListener('click', () => { const l = history.redoLabel; rest
 /** Apply a change to the doc. level: 'geom' (needs new line) or 'render' (style only). */
 function change(mutate, { label, level = 'geom', live = false, thumbs: th = false } = {}) {
   mutate(doc);
+  if (realistic() && level === 'geom') realState.dirty = true;
   finishDemo();
   if (live) invalidate(lastGeomMs > 34 ? 'draft' : 'geom');
   else invalidate(level);
@@ -674,7 +854,7 @@ function buildPapers() {
 function setPaper(id) {
   const p = paperById(id);
   if (p.id === doc.paper) return;
-  change(d => { d.paper = p.id; }, { label: `Paper: ${p.name}`, level: 'geom', thumbs: true });
+  change(d => { d.paper = p.id; if (realistic()) d.real.paperChosen = true; }, { label: `Paper: ${p.name}`, level: 'geom', thumbs: true });
   announce(p.name);
 }
 
@@ -780,6 +960,7 @@ const mazeSliders = {};
 const picking = { active: false, hover: null, flash: 0 };
 function setPicking(on) {
   if (on && (!photo || framing.active)) return;
+  if (on) loupe.fit({ instant: true });
   picking.active = on;
   picking.hover = null;
   $('sheet').classList.toggle('picking', on);
@@ -820,6 +1001,7 @@ $('lineReset').addEventListener('click', () => {
 });
 
 function updateStat() {
+  updateRealInfo();
   const el = $('lineStat');
   if (!geom) { el.textContent = ''; return; }
   const m = printedLength(geom, CIRCLE_MM);
@@ -855,11 +1037,286 @@ const autoToggle = document.querySelector('[data-bind="auto"]');
 const invertToggle = document.querySelector('[data-bind="invert"]');
 autoToggle.addEventListener('change', () => change(d => { d.tone.auto = autoToggle.checked; }, { label: 'Auto tone', thumbs: true }));
 invertToggle.addEventListener('change', () => change(d => { d.tone.invert = invertToggle.checked; }, { label: 'Invert tones', thumbs: true }));
-$('photoReset').addEventListener('click', () => change(d => { d.tone = { ...TONE_DEFAULTS }; }, { label: 'Reset photo', thumbs: true }));
+// Realistic: back to the style's own tone defaults (the squiggle wants more local contrast)
+$('photoReset').addEventListener('click', () => change(d => { d.tone = realistic() ? styleTone(d.real.style) : { ...TONE_DEFAULTS }; }, { label: 'Reset photo', thumbs: true }));
+
+// ------------------------------------------------------------------------------------ realistic mode
+// "A real pen on a real sheet": the Style picker (A-D with live thumbnails), the detail preset, real
+// tools at their real width, the sheet size (auto = the smallest standard sheet on which this tool
+// can draw a face in this style) and the light. Switching modes keeps the photo, the framing and
+// the tone; each mode remembers its own tool, ink and paper.
+const styleTone = id => ({ ...TONE_DEFAULTS, ...realStyleById(id).tone });
+/** Carry the user's tone over, but move each untouched setting from one default to the next. */
+function retone(d, from, to) {
+  for (const k of Object.keys(to)) if (from[k] !== to[k] && d.tone[k] === from[k]) d.tone[k] = to[k];
+}
+const toolSizeLabel = (t, mm) => (t.label && mm === t.sizes[0] ? t.label : `${mm} mm`);
+
+function setMode(v) {
+  if (v === doc.mode || !['artistic', 'realistic'].includes(v)) return;
+  change(d => {
+    d.stash = { ...d.stash, [d.mode]: { brush: d.brush, ink: d.ink, inkSource: d.inkSource, paper: d.paper } };
+    const back = d.stash[v];
+    if (v === 'realistic') {
+      // the first time, the current tool carries over when it is a real drawing tool
+      const cand = back?.brush ?? d.brush;
+      const real = REAL_TOOLS.some(t => t.brush === cand);
+      const t = realToolFor(real ? cand : d.real.tool);
+      d.mode = 'realistic';
+      d.real.tool = d.brush = t.brush;
+      if (!t.sizes.includes(d.real.toolMm)) d.real.toolMm = t.sizes[0];
+      if (back) Object.assign(d, { ink: back.ink, inkSource: back.inkSource, paper: back.paper });
+      else if (!real) Object.assign(d, { ink: t.ink, inkSource: 'swatch', paper: t.paper });
+      // the real builders draw in one ink: colour from the photo is an Artistic effect
+      if (d.inkSource === 'photo') { d.inkSource = 'swatch'; d.ink = t.ink; }
+      retone(d, TONE_DEFAULTS, styleTone(d.real.style));
+      syncAutoSheet(d);
+    } else {
+      d.mode = 'artistic';
+      if (back) Object.assign(d, back);
+      retone(d, styleTone(d.real.style), TONE_DEFAULTS);
+    }
+  }, { label: v === 'realistic' ? 'Realistic mode' : 'Artistic mode', thumbs: true });
+  loupe.fit({ instant: true });
+  if (v === 'realistic' && tabs.find(t => t.getAttribute('aria-selected') === 'true')?.dataset.tab === 'line') selectTab('looks');
+  play.f = 1; setPlaying(false);
+  announce(v === 'realistic'
+    ? `Realistic mode: ${realStyleById(doc.real.style).name}, ${doc.real.toolMm} millimetre ${realToolFor(doc.real.tool).name.toLowerCase()} on a ${formatMm(doc.real.sheetMm)} sheet`
+    : 'Artistic mode');
+}
+const modeSeg = bindSeg(document.querySelector('[data-bind="mode"]'), doc.mode, v => setMode(v));
+
+const stylesEl = $('realStyles');
+function buildStyles() {
+  stylesEl.replaceChildren(...REAL_STYLES.map((st, i) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'style-card';
+    b.setAttribute('role', 'radio');
+    b.dataset.id = st.id;
+    b.title = `${st.letter} · ${st.name} (${i + 1})`;
+    b.innerHTML = '<span class="thumb"><canvas></canvas><span class="skeleton"></span><span class="letter" aria-hidden="true"></span></span><span class="name"></span><span class="blurb"></span>';
+    b.querySelector('.letter').textContent = st.letter;
+    b.querySelector('.name').textContent = st.name;
+    b.querySelector('.blurb').textContent = st.blurb;
+    b.setAttribute('aria-label', `${st.letter}: ${st.name}. ${st.blurb}`);
+    b.addEventListener('click', () => setRealStyle(st.id));
+    return b;
+  }));
+  rovingGrid(stylesEl);
+}
+function setRealStyle(id) {
+  const st = realStyleById(id);
+  if (st.id === doc.real.style) return;
+  sheetSnap = null;
+  change(d => { retone(d, styleTone(d.real.style), styleTone(st.id)); d.real.style = st.id; syncAutoSheet(d); },
+    { label: `Style: ${st.name}`, thumbs: true });
+  announce(`${st.letter}, ${st.name}`);
+}
+const PRESET_NAME = { quick: 'Quick sketch', detailed: 'Detailed', masterpiece: 'Masterpiece' };
+const presetSeg = bindSeg(document.querySelector('[data-bind="realPreset"]'), doc.real.preset, v =>
+  change(d => { d.real.preset = v; syncAutoSheet(d); }, { label: `Detail: ${PRESET_NAME[v]}` }));
+
+const realToolsEl = $('realTools');
+function buildRealTools() {
+  realToolsEl.replaceChildren(...REAL_TOOLS.map(t => {
+    const el = document.createElement('button');
+    el.type = 'button';
+    el.className = 'chip';
+    el.setAttribute('role', 'radio');
+    el.dataset.id = t.brush;
+    const sizes = t.sizes.length > 1 ? `${Math.min(...t.sizes)}–${Math.max(...t.sizes)} mm` : toolSizeLabel(t, t.sizes[0]);
+    el.title = `${t.name}, ${sizes}`;
+    el.innerHTML = '<span class="thumb"><canvas></canvas><span class="skeleton"></span></span><span class="name"></span><span class="size"></span>';
+    el.querySelector('.name').textContent = t.chip || t.name;
+    el.querySelector('.size').textContent = sizes;
+    el.addEventListener('click', () => setRealTool(t.brush));
+    return el;
+  }));
+  rovingGrid(realToolsEl);
+}
+function setRealTool(id, mm) {
+  const t = realToolFor(id);
+  const size = mm ?? (t.brush === doc.real.tool ? doc.real.toolMm : t.sizes[0]);
+  if (t.brush === doc.real.tool && size === doc.real.toolMm) return;
+  const b = brushById(t.brush);
+  const newTool = t.brush !== doc.real.tool;
+  sheetSnap = null;
+  change(d => {
+    // a new instrument starts on its own real paper in its own ink (chalk on a board, charcoal on
+    // cold-press), unless a paper was picked by hand; a new nib size of the same pen keeps both
+    if (newTool && !d.real.paperChosen) Object.assign(d, { paper: t.paper, ink: t.ink, inkSource: 'swatch' });
+    else if (newTool) d.ink = inkFor(b);
+    d.real.tool = d.brush = t.brush; d.real.toolMm = size; syncAutoSheet(d);
+  }, { label: `Tool: ${t.name} ${size} mm`, thumbs: true });
+  announce(`${t.name}, ${size} millimetres${doc.real.sheetAuto || sheetSnap ? `, ${formatSheet(doc.real.sheetMm)} sheet` : ''}`);
+}
+function buildRealSizes() {
+  const t = realToolFor(doc.real.tool);
+  const host = $('realSizes');
+  $('realSizeRow').hidden = t.sizes.length < 2;
+  if (host.dataset.tool === t.brush) return;
+  host.dataset.tool = t.brush;
+  host.replaceChildren(...[...t.sizes].sort((a, b) => a - b).map(mm => {
+    const b = document.createElement('button');
+    b.type = 'button'; b.setAttribute('role', 'radio'); b.dataset.v = String(mm);
+    b.textContent = `${mm} mm`;
+    return b;
+  }));
+  host.segCtl = bindSeg(host, String(doc.real.toolMm), v => setRealTool(t.brush, +v));
+}
+
+const sheetSel = $('realSheet');
+// The drawing is square: an 'A4' sheet is the 21 x 21 cm square on A4 paper, and says so
+const sheetName = mm => { const s = SHEETS.find(x => x.mm === mm); return s && /^A\d$/.test(s.name) ? `${formatSheet(mm)} (on ${s.name})` : formatSheet(mm); };
+function buildSheetOptions() {
+  const r = doc.real;
+  const auto = autoSheet(r.style, r.toolMm);
+  const opts = [new Option(`Auto · ${sheetName(auto)}`, 'auto')];
+  for (const s of SHEETS) {
+    const fit = sheetFit(r.style, r.toolMm, s.mm);
+    const o = new Option(`${sheetName(s.mm)}${fit.tooSmall ? ' · too small for this tool' : fit.tooBig ? ' · tool too fine for this size' : ''}`, String(s.mm));
+    o.disabled = fit.tooBig && s.mm !== r.sheetMm;
+    opts.push(o);
+  }
+  sheetSel.replaceChildren(...opts);
+  sheetSel.value = r.sheetAuto ? 'auto' : String(r.sheetMm);
+}
+sheetSel.addEventListener('change', () => {
+  const v = sheetSel.value;
+  sheetSnap = null;
+  change(d => {
+    if (v === 'auto') { d.real.sheetAuto = true; d.real.sheetPick = null; syncAutoSheet(d); }
+    else { d.real.sheetAuto = false; d.real.sheetMm = d.real.sheetPick = +v; }
+  }, { label: 'Sheet size' });
+  announce(`${sheetName(doc.real.sheetMm)} sheet`);
+});
+const LIGHT_NAME = { window: 'Window', raking: 'Raking', overhead: 'Overhead' };
+const lightSeg = bindSeg(document.querySelector('[data-bind="realLight"]'), doc.real.light, v =>
+  change(d => { d.real.light = v; }, { label: `Light: ${LIGHT_NAME[v]}`, level: 'render' }));
+
+/** The honest numbers: metres of line, time by hand, the tool and the sheet. */
+function updateRealInfo() {
+  if (!realistic()) { updateScaleCaption(null); return; }
+  const r = doc.real, t = realToolFor(r.tool);
+  const what = `${toolSizeLabel(t, r.toolMm)} ${t.name.toLowerCase()} on a ${formatSheet(r.sheetMm)} sheet`;
+  const g = geom?.real;
+  const current = g && g.style === r.style && g.toolMm === r.toolMm && g.sheetMm === r.sheetMm && g.preset === r.preset;
+  const el = $('realInfo');
+  if (current && !$('sheet').classList.contains('building')) {
+    const m = g.lengthM;
+    el.innerHTML = `<b>${m >= 10 ? m.toFixed(0) : m.toFixed(1)} m</b> of line · about <b>${formatHand(g.handSeconds)}</b> by hand · `;
+    el.append(what);
+  } else if (realState.failed && realState.failed === realState.want) {
+    el.textContent = `Could not draw this · ${what}`;
+  } else {
+    el.textContent = `Drawing the line… · ${what}`;
+  }
+  updateScaleCaption(current ? g : null);
+}
+
+/**
+ * The stage's scale: a bar of a round real length and the sheet, tool and hand time, so a 1.5 m
+ * sheet never passes for A4 (the stage always shows the whole sheet the same size).
+ */
+function updateScaleCaption(g) {
+  const cap = $('realScale');
+  if (!cap) return;
+  cap.hidden = !realistic() || !photo;
+  if (cap.hidden) return;
+  const r = doc.real, t = realToolFor(r.tool);
+  // the longest round length up to a quarter of the sheet width
+  const cm = [1, 2, 5, 10, 20, 50].filter(c => c * 10 <= r.sheetMm * 0.25).pop() || 1;
+  cap.style.setProperty('--bar', `${(cm * 10 / r.sheetMm) * 100}`);
+  $('realScaleLen').textContent = cm >= 100 ? `${cm / 100} m` : `${cm} cm`;
+  $('realScaleTxt').textContent = `${formatSheet(r.sheetMm)} · ${toolSizeLabel(t, r.toolMm)} ${t.name.toLowerCase()}${g ? ` · ~${formatHand(g.handSeconds)} by hand` : ''}`;
+}
+
+function syncReal() {
+  const r = doc.real, st = realStyleById(r.style), t = realToolFor(r.tool);
+  setChecked([...stylesEl.children], el => el.dataset.id === r.style);
+  $('styleValue').textContent = `${st.letter} · ${st.name}`;
+  presetSeg.set(r.preset);
+  setChecked([...realToolsEl.children], el => el.dataset.id === r.tool);
+  $('toolValue').textContent = `${t.name} · ${toolSizeLabel(t, r.toolMm)}`;
+  buildRealSizes();
+  $('realSizes').segCtl?.set(String(r.toolMm));
+  buildSheetOptions();
+  const fit = sheetFit(r.style, r.toolMm, r.sheetMm);
+  const auto = autoSheet(r.style, r.toolMm);
+  $('sheetHelp').textContent = r.sheetAuto
+    ? `The smallest sheet on which a ${r.toolMm} mm ${t.name.toLowerCase()} can draw a face in this style.${r.sheetMm > 420 ? ' The line keeps its real width, so a broad tool needs a big sheet.' : ''}`
+    : 'The line always keeps its real width: a bigger sheet means more line and more detail.';
+  const warn = $('sheetWarn');
+  const snapped = sheetSnap && sheetSnap.to === r.sheetMm && !r.sheetAuto && sheetSnap.tool === r.tool && sheetSnap.toolMm === r.toolMm;
+  warn.hidden = !fit.tooSmall && !snapped;
+  if (snapped && !fit.tooSmall) {
+    warn.replaceChildren();
+    const span = document.createElement('span');
+    span.textContent = `${formatSheet(sheetSnap.from)} is too big for a ${r.toolMm} mm ${t.name.toLowerCase()}: it would need more line than one drawing can hold, so the sheet moved to ${formatSheet(r.sheetMm)}.`;
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'text-btn'; btn.textContent = `Use Auto · ${sheetName(auto)}`;
+    btn.addEventListener('click', () => { sheetSel.value = 'auto'; sheetSel.dispatchEvent(new Event('change')); });
+    warn.append(span, btn);
+  }
+  if (fit.tooSmall) {
+    warn.replaceChildren();
+    const span = document.createElement('span');
+    span.textContent = `A ${r.toolMm} mm ${t.name.toLowerCase()} is too broad to draw a face on ${formatSheet(r.sheetMm)} in this style: the drawing will read as shapes only.`;
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'text-btn'; btn.textContent = `Use ${sheetName(auto)}`;
+    btn.addEventListener('click', () => { sheetSel.value = 'auto'; sheetSel.dispatchEvent(new Event('change')); });
+    warn.append(span, btn);
+  }
+  lightSeg.set(r.light);
+  updateRealInfo();
+}
+
+// Style cards: the user's photo drawn in each style (built in the worker, rendered by the shared
+// thumbnail renderer). Each uses a tool just fine enough for a face on the card's small sheet.
+const styleThumbGeoms = new Map();
+function refreshStyleThumbs() {
+  if (!photo || !realistic()) return;
+  const dpr = DPR(), b = brush(), p = paper(), m = mode(), fl = flip();
+  for (const el of stylesEl.children) {
+    const st = realStyleById(el.dataset.id);
+    const canvas = el.querySelector('canvas');
+    const size = Math.round((canvas.clientWidth || 120) * dpr);
+    // a line of about a card pixel or more (0.84 mm on a 250 px card of a 21 cm sheet) and still
+    // fine enough for a face in this style
+    const opts = { sheetMm: 210, toolMm: +(210 / Math.max(st.minSheetRatio * 1.15, 250)).toFixed(3), preset: 'detailed', tool: b.id, seed: 1 };
+    const gk = keyOf('stylethumb', st.id, photo.id, doc.crop, doc.tone, fl, opts);
+    const key = keyOf(gk, b.id, doc.ink, p.id, size, m.cover);
+    if (canvas.dataset.key === key) continue;
+    const show = g => thumbs.add({
+      canvas, key, width: size, height: size, needs: { brush: b, paper: p },
+      render: r => {
+        r.setLayout(LAYOUT); r.setPaper(p, 1);
+        r.setStyle({ brush: b, ink: doc.ink, cover: m.cover, photoColor: false });
+        r.setGeometry(g); return r.render(Infinity);
+      },
+    }, st.id === doc.real.style);
+    const have = styleThumbGeoms.get(gk);
+    if (have) { show(have); continue; }
+    // after the stage's own build has been queued (next frame), so the drawing never waits for a card
+    setTimeout(() => {
+      if (!photo || !realistic()) return;
+      realBuilder.build(st.id, thumbField(fl, realFieldRings(st.id, opts)), opts, { tag: `thumb:${st.id}` }).then(g => {
+        if (!g) return;
+        styleThumbGeoms.set(gk, g);
+        if (styleThumbGeoms.size > 12) styleThumbGeoms.delete(styleThumbGeoms.keys().next().value);
+        if (realistic()) show(g);
+      });
+    }, 60);
+  }
+}
 
 // ------------------------------------------------------------------------------------ sync UI from doc
 function syncControls() {
   const b = brush(), p = paper();
+  document.body.classList.toggle('realistic', realistic());
+  modeSeg.set(doc.mode);
+  $('tabLooksName').textContent = realistic() ? 'Style' : 'Looks';
   setChecked([...looksEl.children], el => el.dataset.id === doc.look);
   const edited = lookEdited();
   for (const el of looksEl.children) {
@@ -899,12 +1356,13 @@ function syncControls() {
   invertToggle.checked = !!doc.tone.invert;
   for (const [k, s] of Object.entries(photoSliders)) s.set(doc.tone[k]);
   photoSliders.brightness.el.hidden = !!doc.tone.auto;
-  $('photoReset').hidden = JSON.stringify(doc.tone) === JSON.stringify({ ...TONE_DEFAULTS, ...{} });
+  $('photoReset').hidden = JSON.stringify(doc.tone) === JSON.stringify(realistic() ? styleTone(doc.real.style) : { ...TONE_DEFAULTS });
   $('flipNote').hidden = !mode().flip;
   startSeg.set(doc.line.start);
   pacingSeg.set(prefs.pacing);
   updateHints();
   updateArtLabel();
+  if (realistic()) syncReal();
 }
 
 function updateHints() {
@@ -944,7 +1402,10 @@ function updateArtLabel() {
   clearTimeout(updateArtLabel.t);
   updateArtLabel.t = setTimeout(() => {
     const what = photo ? (photo.sample ? `The ${photo.name} sample` : 'Your photo') : 'A blank sheet';
-    art.setAttribute('aria-label', photo
+    const r = doc.real;
+    art.setAttribute('aria-label', photo && realistic()
+      ? `${what} drawn in the ${realStyleById(r.style).name.toLowerCase()} style as one ${r.toolMm} millimetre line of a ${realToolFor(r.tool).name.toLowerCase()} on a ${formatMm(r.sheetMm)} sheet of ${paper().name} paper.`
+      : photo
       ? `${what} drawn as one spiral line with a ${brush().name.toLowerCase()} in ${photoColor() ? 'colours from the photo' : inkName(brush(), doc.ink).toLowerCase() + ' ink'} on ${paper().name} paper, ${doc.line.rings} rings.`
       : 'A blank sheet of paper');
   }, 1000);
@@ -989,9 +1450,10 @@ function refreshThumbs(photoChanged = false) {
       }, look.id === doc.look);
     }
   }
-  // tool chips: a spiral fragment in each tool, on the current paper
+  refreshStyleThumbs();
+  // tool chips: a spiral fragment in each tool, on the current paper (Artistic and Realistic grids)
   const p = paper();
-  for (const el of toolsEl.children) {
+  for (const el of [...toolsEl.children, ...realToolsEl.children]) {
     const b = brushById(el.dataset.id);
     const canvas = el.querySelector('canvas');
     const w = Math.round((canvas.clientWidth || 70) * dpr), h = Math.round((canvas.clientHeight || 52) * dpr);
@@ -1047,6 +1509,7 @@ function scheduleIdleWork() {
 // ------------------------------------------------------------------------------------ photos
 async function setPhoto(img, { sample = false, crop = null, demo = true, announceIt = true } = {}) {
   photo = { ...img, id: ++photoSeq, sample };
+  loupe.fit({ instant: true });
   doc.crop = crop ? { ...CROP_DEFAULTS, ...crop } : autoCrop(img);
   delete thumbCache.rk;
   $('fileName').textContent = sample ? `${img.name} (sample)` : img.name;
@@ -1175,6 +1638,7 @@ function enterFraming() {
   finishDemo();
   setPlaying(false);
   play.f = 1;
+  loupe.fit({ instant: true });
   framing.active = true;
   framing.start = { ...doc.crop };
   sheet.classList.add('framing');
@@ -1266,7 +1730,7 @@ sheet.addEventListener('wheel', e => {
   clearTimeout(sheet.wheelT);
   sheet.wheelT = setTimeout(() => invalidate('geom'), 160);
 }, { passive: false });
-sheet.addEventListener('dblclick', () => { if (!framing.active) enterFraming(); });
+// (a double-click on the sheet zooms the loupe in now; F and the Frame button frame)
 frZoom.addEventListener('input', () => { doc.crop.zoom = sliderToZoom(+frZoom.value); paintRange(frZoom); invalidate('draft'); });
 frZoom.addEventListener('change', () => invalidate('geom'));
 $('frRotate').addEventListener('click', () => { doc.crop.rotation = (((doc.crop.rotation || 0) + 90 + 180) % 360) - 180; invalidate('geom'); });
@@ -1378,6 +1842,13 @@ async function openFilm() {
 async function openDownload(quick = false) {
   if (!geom) return toast('Choose a photo first.');
   const d = (await loadDialogs()).download;
+  // Realistic: the files are real-size (the SVG is a plotter file of the real sheet and pen)
+  const note = $('dlRealNote');
+  note.hidden = !geom?.real;
+  if (geom?.real) {
+    const r = geom.real;
+    note.textContent = `Realistic: the SVG is a real-size plotter file — one path, ${r.toolMm} mm stroke, ${formatMm(r.sheetMm)} × ${formatMm(r.sheetMm)} sheet, ${r.lengthM.toFixed(1)} m of line. The PNG is the rendered sheet.`;
+  }
   quick ? d.quick() : d.open();
 }
 $('btnFilm').addEventListener('click', openFilm);
@@ -1426,6 +1897,22 @@ window.addEventListener('keydown', e => {
   if (k === 'f' || k === 'F') { e.preventDefault(); enterFraming(); return; }
   if (k === 'r' || k === 'R') { e.preventDefault(); openFilm(); return; }
   if (k === '?') { e.preventDefault(); $('keysDialog').showModal(); return; }
+  // loupe: + / - zoom around the middle of the view, 0 fits the whole sheet
+  if ((k === '+' || k === '=') && photo) { e.preventDefault(); loupe.zoomBy(2); return; }
+  if ((k === '-' || k === '_') && photo) { e.preventDefault(); loupe.zT / 2 <= 1.05 ? loupe.fit() : loupe.zoomBy(0.5); return; }
+  if (k === '0' && photo) { e.preventDefault(); loupe.fit(); return; }
+  if (k === 'm' || k === 'M') { e.preventDefault(); setMode(realistic() ? 'artistic' : 'realistic'); return; }
+  if (realistic()) {
+    // 1-4 pick the style (A-D), [ and ] step the detail preset
+    if (/^[1-4]$/.test(k)) { e.preventDefault(); setRealStyle(REAL_STYLES[+k - 1].id); return; }
+    if (k === '[' || k === ']') {
+      e.preventDefault();
+      const ids = ['quick', 'detailed', 'masterpiece'];
+      const i = clamp(ids.indexOf(doc.real.preset) + (k === ']' ? 1 : -1), 0, 2);
+      if (ids[i] !== doc.real.preset) { change(d => { d.real.preset = ids[i]; }, { label: `Detail: ${PRESET_NAME[ids[i]]}` }); announce(PRESET_NAME[ids[i]]); }
+    }
+    return;
+  }
   if (/^[1-9]$/.test(k) && LOOKS[+k - 1]) { e.preventDefault(); applyLook(LOOKS[+k - 1].id); return; }
   if (k === '[' || k === ']') {
     e.preventDefault();
@@ -1439,7 +1926,9 @@ window.addEventListener('keyup', e => { if (e.key === '\\') setCompare(false); }
 // ------------------------------------------------------------------------------------ boot
 async function boot() {
   buildLooks();
+  buildStyles();
   buildTools();
+  buildRealTools();
   buildInks();
   inksEl.dataset.brush = doc.brush;
   buildPapers();
@@ -1456,6 +1945,7 @@ async function boot() {
 
   const session = await loadPhoto();
   const welcome = $('welcome');
+  if (realistic()) $('welcomeLede').textContent = 'Choose an image and watch it drawn as one real line, at the pace of a hand.';
   welcome.hidden = false;
   document.body.classList.add('welcoming');
   buildSamples();
@@ -1494,7 +1984,11 @@ if ('serviceWorker' in navigator && location.protocol === 'https:' || location.h
 window.SP = {
   get doc() { return doc; }, get prefs() { return prefs; }, get geom() { return geom; }, get photo() { return photo; },
   get toneStats() { return cache.tone?.stats; },
-  play, renderer, change, applyLook, setBrush, setPaper, openSample, enterFraming, exitFraming,
+  play, renderer, loupe, change, applyLook, setBrush, setPaper, openSample, enterFraming, exitFraming,
+  setMode, setRealStyle, setRealTool, realBuilder, get building() {
+    return $('sheet').classList.contains('building') || realBuilder.busy
+      || (realistic() && !!photo && (realState.dirty || (realState.want !== realState.key && realState.want !== realState.failed)));
+  },
   openFilm, openDownload, invalidate, renderState, history,
   async shot(name = 'app') {
     const data = art.toDataURL('image/png');

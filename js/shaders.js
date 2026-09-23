@@ -15,7 +15,7 @@
 
 import { BRUSH_GLSL } from './brushes.js';
 import { PAPER_TILE_GLSL, PAPER_SURFACE_GLSL, PAPER_PHYS_GLSL, PAPER_FIBRE_GLSL } from './papers.js';
-import { STEPS_SETTLE } from './wetsim.js';
+import { STEPS_SETTLE, WET_FIBRE_GLSL } from './wetsim.js';
 
 export const TILES_ACROSS = 6.0;
 export const TILE_SIZE = 1024;
@@ -50,7 +50,9 @@ uniform sampler2D uPaperTex;
 uniform float uTilePx;     // output px covered by one tile
 uniform float uTileLod;    // log2(TILE_SIZE / uTilePx)
 uniform float uPaperPx;    // full paper width in px
-uniform float uU;          // px per paper unit (paper width / 1000)
+uniform float uU;          // px per paper unit (0.21 mm of paper: paper width / 1000 on a 210 mm sheet)
+uniform float uPhysPx;     // px per 210 mm of paper (= uPaperPx on the default sheet, renderer.setSheetMm):
+                           // what physical textures (grain patches, flocs, cockle) are sized by
 // Returns (mean height, std-dev hidden below this resolution, specks). Two decorrelated
 // samplings are blended by a slow mask so the tile never visibly repeats.
 vec3 grainAt(vec2 P, float lodBias) {
@@ -59,7 +61,7 @@ vec3 grainAt(vec2 P, float lodBias) {
   vec2 uv2 = mat2(0.7986, -0.6018, 0.6018, 0.7986) * (P / (uTilePx * 1.137)) + vec2(0.37, 0.71);
   vec4 a = textureLod(uPaperTex, uv1, lod);
   vec4 b = textureLod(uPaperTex, uv2, lod);
-  float m = smoothstep(0.25, 0.75, vnoise(P / uPaperPx * 7.0 + 3.1));
+  float m = smoothstep(0.25, 0.75, vnoise(P / uPhysPx * 7.0 + 3.1));
   vec4 t = mix(a, b, m);
   float v = max(0.0, t.g - t.r * t.r);
   return vec3(t.r, sqrt(v), t.b);
@@ -132,6 +134,7 @@ layout(location = 2) in vec4 aB;   // point i+1
 layout(location = 3) in vec3 aBt;
 layout(location = 4) in vec4 aCol; // photo colour of point i (normalised bytes)
 layout(location = 5) in vec4 aT;   // pacing time (0..1) and curvature (1 / circle units) of points i, i+1
+layout(location = 6) in vec2 aFeed; // the pen's feed deficit at points i, i+1 (wetsim.js feedDeficit; unbound = 0)
 uniform vec2 uRes;       // render target size px
 uniform vec2 uOrigin;    // target's top-left on the paper, px
 uniform vec2 uCenter;    // circle centre on the paper, px
@@ -150,6 +153,7 @@ flat out vec4 vCol;
 flat out vec2 vDwell;
 flat out float vTime;
 flat out vec2 vCurv;
+flat out vec2 vFeed;
 out vec2 vPos;
 void main() {
   vec2 p0 = uCenter + aA.xy * uRadius;
@@ -171,6 +175,7 @@ void main() {
   vDwell = vec2(max(aAt.z, 1.0), max(aBt.z, 1.0));
   vTime = aT.z;
   vCurv = aT.yw / uRadius;
+  vFeed = aFeed;
   vCol = aCol;
   vec2 q = pos - uOrigin;
   gl_Position = vec4(q.x / uRes.x * 2.0 - 1.0, 1.0 - q.y / uRes.y * 2.0, 0.0, 1.0);
@@ -188,6 +193,7 @@ flat in vec4 vCol;
 flat in vec2 vDwell;
 flat in float vTime;
 flat in vec2 vCurv;      // curvature of points i, i+1 in 1 / px
+flat in vec2 vFeed;      // the pen's feed deficit at points i, i+1
 // Paper px of this fragment. Taken from gl_FragCoord, not the interpolated vPos: pixel centres are
 // exact there (x + 0.5) and the origin is whole, so a strip of a big export computes bit for bit
 // what a single full pass does. An interpolated varying rounds differently for every target size,
@@ -389,6 +395,8 @@ uniform float uSimSharp;   // 0..1: how firmly unmoved simulated pigment follows
 ${COMMON}
 ${GRAIN}
 ${PAPER_SURFACE_GLSL}
+${PAPER_FIBRE_GLSL}
+${WET_FIBRE_GLSL}
 
 // Light flickering in a gas tube: a slow breathing plus rare short dips (neon, setTime).
 float flicker(float t) {
@@ -419,7 +427,7 @@ float strandAt(vec2 P) {
   float lod = max(0.0, uTileLod);
   vec2 uv1 = P / uTilePx;
   vec2 uv2 = mat2(0.7986, -0.6018, 0.6018, 0.7986) * (P / (uTilePx * 1.137)) + vec2(0.37, 0.71);
-  float m = smoothstep(0.25, 0.75, vnoise(P / uPaperPx * 7.0 + 3.1));
+  float m = smoothstep(0.25, 0.75, vnoise(P / uPhysPx * 7.0 + 3.1));
   return mix(textureLod(uPaperTex, uv1, lod).a, textureLod(uPaperTex, uv2, lod).a, m);
 }
 // The same B-spline for all four channels (the wet state: its pigment and water then have smooth,
@@ -569,6 +577,8 @@ void main() {
       Qown = Qa * k / max(cm, 1e-4) * (1.0 + 0.3 * wetK);
     }
     Q = (Qs + soakQ) * (1.0 + 0.3 * wetK);
+    // feathering at fibre scale: hairs of ink along single fibres (wetsim.js WET_FIBRE_GLSL)
+    if (uHair > 0.0) Q += fibreHairs(P) * uHair * (1.0 - pig.a);
     inkQ = uInk;
     if (uPhotoColor == 1) {
       vec4 pl = textureLod(uPigment, uv, uPigLod);
@@ -658,7 +668,18 @@ void main() {
   vec2 dT = vec2(dl.x, -dl.y);                    // one px away from the light (texel rows run up)
   float slope = (reliefAt(ip, hiP, dT) - reliefAt(ip, hiP, -dT)) * 0.5 * uSurfU;   // height (px) per px
   // (+ = rising away from the light, i.e. facing it)
-  col *= clamp(1.0 + slope * uCotEl, 0.55, 1.45);
+  // The mark sits in and on a translucent sheet: light entering a lit flank leaks under into the
+  // shaded one, so its shading grows slower than a plaster's as the light drops (like the paper's:
+  // papers.js, cot^0.7 relative to the window light, which keeps its look exactly). A soft knee
+  // replaces the hard clip: under a raking light a hard clip turned every groove and wax edge into
+  // a black-and-burnt-out pair whose white half then clipped, which greyed the whole drawing.
+  float gRel = uCotEl * exp2(-0.3 * log2(max(uCotEl, 1e-3) / 1.19175));
+  float xr = slope * gRel;
+  float fr = xr >= 0.0 ? min(xr, 0.2) + 0.15 * (1.0 - exp(-max(xr - 0.2, 0.0) / 0.15))
+                       : -(min(-xr, 0.2) + 0.2 * (1.0 - exp(-max(-xr - 0.2, 0.0) / 0.2)));
+  col *= 1.0 + fr;
+  // the sheet's cockle where it got very wet: a low swell that stays once dry (wetsim.js)
+  if (uSimOn == 1 && uCockle > 0.0) col *= cockleShade(P);
 
   // ---- specular. Normal of the medium's surface (4 taps) and, while wet, of the liquid film.
   vec4 sx0 = texelFetch(uSurf, clamp(ip - ivec2(1, 0), ivec2(0), hiP), 0), sx1 = texelFetch(uSurf, clamp(ip + ivec2(1, 0), ivec2(0), hiP), 0);
@@ -714,7 +735,10 @@ void main() {
       float ch = acos(clamp(dot(Ns, H), -1.0, 1.0)), chf = acos(clamp(dot(Nf, H), -1.0, 1.0));
       // (a resolved flake mirrors the window itself, a disc ~9 deg across in half-vector angle
       // with the same energy as the lobes: it is either blazing or shows the room)
-      float kf = mix((0.0985 / s2f) * exp(-0.5 * chf * chf / s2f), 7.7 * (1.0 - smoothstep(0.12, 0.2, chf)), k * k);
+      // (an unresolved flake's lobe carries its energy as the average over flakes; resolved, the few
+      // that blaze go through the photo shoulder below and keep only ~1/8 of it, so the folded lobe
+      // is dimmed by as much: a preview then shows what the export's pixels average to)
+      float kf = mix(0.1 * (0.0985 / s2f) * exp(-0.5 * chf * chf / s2f), 7.7 * (1.0 - smoothstep(0.12, 0.2, chf)), k * k);
       // (a flake is only partly lifted off the leaf: half of it still follows the leaf's surface)
       float key = 2.4 * mix((0.0985 / s2) * exp(-0.5 * ch * ch / s2), kf, 0.55 * flake);
       // the room: dimmer than the sheet (walls and ceiling lit by the window, ~0.3 of white paper),

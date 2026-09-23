@@ -2,7 +2,7 @@
 // needed one). Network-first for everything this site serves, so an update is picked up on the
 // next load and modules from two different releases are never mixed; the cache is the fallback.
 // Google Fonts are cached on first use.
-const CACHE = 'spiralist-2026-09-23b';
+const CACHE = 'spiralist-2026-09-23d';
 // every module the app imports (statically or on demand) and the film's desk photos, so the whole
 // app, filming included, works offline after the first visit
 const DESK_IDS = ['nero', 'calacatta', 'travertine', 'limewash', 'velvet', 'leather', 'sunlit', 'onyx'];
@@ -12,6 +12,8 @@ const SHELL = [
   './js/freeline.js', './js/history.js', './js/imageio.js', './js/materials.js', './js/maze.js', './js/papers.js',
   './js/renderer.js', './js/samples.js', './js/scene.js', './js/share.js', './js/shaders.js', './js/signature.js',
   './js/spiral.js', './js/store.js', './js/thumbs.js', './js/tone.js', './js/tools.js', './js/ui.js', './js/wetsim.js',
+  './js/loupe.js', './js/real/index.js', './js/real/builder.js', './js/real/worker.js', './js/real/squiggle.js',
+  './js/real/stipple.js', './js/real/scribble.js', './js/real/engrave.js',
   ...DESK_IDS.map(id => `./img/desks/${id}.jpg`),
 ];
 

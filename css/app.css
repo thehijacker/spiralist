@@ -333,6 +333,7 @@ body.welcoming .transport, body.welcoming .stage-tools { visibility: hidden; }
   content: ""; position: absolute; inset: -4px; border-radius: 50%; border: 2px solid var(--accent);
 }
 .swatch.photo { background: conic-gradient(#e0533c, #f2b134, #5fb04a, #3a8fd9, #8b5bd6, #e0533c); }
+body.realistic .swatch.photo { display: none; }   /* the real builders draw in one ink */
 .swatch.custom { background: conic-gradient(from 45deg, #bbb, #fff, #bbb, #fff, #bbb); display: grid; place-items: center; overflow: hidden; }
 .swatch.custom input { position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%; cursor: pointer; border: 0; padding: 0; }
 .swatch-label { font-size: 12px; color: var(--text-muted); margin-left: 4px; }
@@ -342,6 +343,65 @@ body.welcoming .transport, body.welcoming .stage-tools { visibility: hidden; }
   background: var(--accent-soft); font-size: 12.5px;
 }
 .hint-card .text-btn { margin-left: auto; white-space: nowrap; }
+
+/* Artistic | Realistic: the two modes share the photo, the stage and the dialogs */
+body.realistic .artistic-only, body:not(.realistic) .real-only { display: none !important; }
+.mode-bar { padding: 12px 16px 0; flex: none; }
+.mode-seg > button { min-height: 34px; font-weight: 600; }
+.mode-seg > button[data-v="realistic"][aria-checked="true"] { color: var(--accent); }
+.styles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+.style-card { position: relative; border: 0; padding: 0; background: none; text-align: left; color: inherit; font: inherit; cursor: pointer; }
+.style-card .thumb {
+  display: block; width: 100%; aspect-ratio: 1; border-radius: 10px; overflow: hidden; background: var(--surface-2);
+  box-shadow: inset 0 0 0 1px var(--border); position: relative;
+}
+.style-card canvas { width: 100%; height: 100%; display: block; }
+.style-card .letter {
+  position: absolute; top: 6px; left: 6px; width: 20px; height: 20px; border-radius: 6px; display: grid; place-items: center;
+  font-size: 11.5px; font-weight: 600; background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px var(--border);
+}
+.style-card .name { display: block; font-size: 12px; font-weight: 500; margin-top: 6px; }
+.style-card .blurb { display: block; font-size: 11px; line-height: 1.35; color: var(--text-muted); margin-top: 2px; }
+.style-card[aria-checked="true"] .thumb { box-shadow: 0 0 0 2px var(--accent); }
+.style-card[aria-checked="true"] .letter { background: var(--accent); color: #fff; box-shadow: none; }
+.style-card:hover .thumb { box-shadow: inset 0 0 0 1px var(--border-strong); }
+.style-card[aria-checked="true"]:hover .thumb { box-shadow: 0 0 0 2px var(--accent); }
+.real-tools .chip .size { display: block; font-size: 10.5px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.real-info { line-height: 1.5; }
+.select {
+  width: 100%; height: 34px; padding: 0 10px; border-radius: 10px; border: 0; font: inherit; font-size: 13px;
+  color: var(--text); background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--border);
+}
+.select:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+.hint-card.warn { align-items: flex-start; flex-wrap: wrap; }
+.dlg > .real-note { margin-left: 20px; margin-right: 20px; }
+.time.hand { min-width: 0; white-space: nowrap; }
+/* Realistic stage scale: the container spans the sheet, so the rule's % width is real length */
+.real-scale { position: absolute; inset: 0; pointer-events: none; z-index: 2; color: #f4f1ea; font: 500 10.5px/1 var(--sans); font-variant-numeric: tabular-nums; }
+/* a light ruler on a dark translucent strip: it reads on white paper and on a black board; top
+   right, because the phone's stage tools float over the sheet's top left */
+.real-scale-rule i {
+  position: absolute; right: 10px; top: 11px; width: calc(var(--bar, 10) * 1%); height: 9px; box-sizing: border-box;
+  border: 1.5px solid currentColor; border-top: 0; border-radius: 0 0 2px 2px; background: rgba(22, 21, 19, .55);
+}
+.real-scale-rule b, .real-scale-txt {
+  position: absolute; padding: 3px 7px; border-radius: 999px; background: rgba(22, 21, 19, .62); font-weight: 500; white-space: nowrap;
+}
+.real-scale-rule b { right: calc(10px + var(--bar, 10) * 1% + 6px); top: 7px; }
+.real-scale-txt { left: 10px; bottom: 10px; max-width: calc(100% - 20px); overflow: hidden; text-overflow: ellipsis; }
+.sheet.building .real-scale-txt, .sheet:has(.loupe-bar:not([hidden])) .real-scale { display: none; }
+.sheet.building::after {
+  content: attr(data-building); position: absolute; left: 50%; bottom: 10px; transform: translateX(-50%);
+  padding: 5px 10px; border-radius: 999px; font-size: 12px; color: #fff; background: rgba(20, 19, 18, .72);
+  pointer-events: none; white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+@media (max-width: 767px) {
+  .mode-bar { padding: 8px 12px 0; }
+  .mode-seg > button { min-height: 32px; }
+  .styles { grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: 132px; overflow-x: auto; padding-bottom: 4px; }
+  .style-card .blurb { display: none; }
+  body.welcoming .mode-bar { visibility: hidden; }   /* only a sliver would peek above the welcome card */
+}
 
 /* segmented */
 .seg {
@@ -606,3 +666,50 @@ details.more[open] summary::before { transform: rotate(45deg); }
   #filmFootResult { flex-wrap: wrap; row-gap: 8px; }
   #filmShare { margin-left: auto; }        /* (a wrapped main action still sits at the right) */
 }
+
+/* ───────── loupe (zoom into the sheet) ───────── */
+.sheet.zoomed { cursor: grab; }
+.sheet.zoomed.panning { cursor: grabbing; }
+/* dark glass: reads over white sketch paper and black card alike */
+.loupe-bar {
+  position: absolute; right: 10px; bottom: 10px; z-index: 3;
+  display: flex; align-items: center; gap: 2px; height: 34px; padding: 0 3px;
+  border-radius: 999px; background: rgba(22, 21, 19, .74); color: #f4f1ea;
+  border: 1px solid rgba(255, 255, 255, .12); box-shadow: 0 6px 18px -8px rgba(0, 0, 0, .55);
+  -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+  font: 500 12px/1 var(--sans); font-variant-numeric: tabular-nums; cursor: default;
+  animation: pop .16s var(--ease);
+}
+.loupe-btn {
+  height: 28px; min-width: 28px; padding: 0 6px; display: grid; place-items: center;
+  border: 0; border-radius: 999px; background: transparent; color: inherit;
+  transition: background .12s var(--ease);
+}
+.loupe-btn svg { width: 15px; height: 15px; }
+.loupe-btn:hover:not(:disabled) { background: rgba(255, 255, 255, .14); }
+.loupe-btn:disabled { opacity: .35; }
+.loupe-btn:focus-visible { outline: 2px solid #ff7a4d; outline-offset: 1px; border-radius: 999px; }
+.loupe-fit { padding: 0 10px; margin-left: 2px; border-left: 1px solid rgba(255, 255, 255, .16); border-radius: 0 999px 999px 0; }
+.loupe-badge { display: flex; align-items: center; gap: 9px; padding: 0 6px; white-space: nowrap; }
+.loupe-z { min-width: 2.6em; text-align: right; font-weight: 600; }
+.loupe-scale { display: flex; align-items: center; gap: 6px; color: rgba(244, 241, 234, .82); }
+/* a ruler with end ticks; its width is the real length on the paper (set by js/loupe.js) */
+.loupe-rule {
+  display: block; height: 7px; width: 40px;
+  border: 1.5px solid currentColor; border-top: 0; border-radius: 0 0 1px 1px;
+  transition: width .08s linear;
+}
+@media (max-width: 767px) {
+  .loupe-bar { right: 8px; bottom: 8px; height: 38px; gap: 0; font-size: 11.5px; }
+  .loupe-btn { height: 32px; min-width: 32px; }
+  .loupe-badge { gap: 7px; padding: 0 3px; }
+  .loupe-z { min-width: 2.2em; }
+  .loupe-fit { padding: 0 9px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .loupe-bar { animation: none; }
+  .loupe-rule { transition: none; }
+}
+
+/* Film dialog, realistic mode: the hand-time estimate under the length picker */
+.film-hand { margin: 8px 0 0; font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums; }

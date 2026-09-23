@@ -100,7 +100,10 @@ export function lens(b, focus = [0, 0]) {
   // the aperture opens up as the camera backs off (to about 2x at the full sheet), so a tilted
   // wide shot keeps a shallow, filmic focus instead of the deep one a real fixed lens would give
   const zoom = b.F / (b.dist * Math.min(b.W, b.H) * 0.86);
-  const K = 0.5 * APERTURE * clamp(Math.pow(2.8 / zoom, 0.6), 1, 2) * b.F / zf;
+  // b.ap (optional, set by the film on its basis): the aperture relative to today's A4 sheet. A
+  // realistic film of a 1 m sheet keeps the lens's REAL aperture, which is 5x smaller in sheet
+  // widths, so a big sheet does not read as a miniature
+  const K = 0.5 * APERTURE * (b.ap ?? 1) * clamp(Math.pow(2.8 / zoom, 0.6), 1, 2) * b.F / zf;
   const max = COC_MAX * Math.min(b.W, b.H);
   const coc = (x, y, h = 0) => { const z = project(b, x, y, h)[2]; return Math.min(max, K * Math.abs(z - zf) / z); };
   return { zf, K, max, coc };
@@ -188,18 +191,21 @@ export function shotIntent(o) {
     if (mode === 'edge') for (let k = K - 1; k >= 0; k--) { m = Math.max(m, Math.hypot(px[k] - art.x, py[k] - art.y)); reach[k] = m; }
     else for (let k = 0; k < K; k++) { m = Math.max(m, Math.hypot(px[k] - art.x, py[k] - art.y)); reach[k] = m; }
   } else reach[0] = art.r;
-  const F = SHOT.follow;
+  // o.shot (optional): shot sizes of this film ({ center: { close, pull }, follow: { close, mid,
+  // hold, ease } }), e.g. the realistic film's, measured in millimetres of paper in view
+  const F = { ...SHOT.follow, ...(o.shot?.follow || {}) };
+  const C = { ...SHOT.center, ...(o.shot?.center || {}) };
   const tHold = t0 + F.hold, tMid = tHold + F.ease;
   let zoomAt, zclose;
   if (mode === 'center') {
-    zclose = SHOT.center.close;
+    zclose = C.close;
     // A slow push-in while the pen comes down (the shot is alive from its first frame), the
     // close-up while the pen draws at real speed, then a pull-back that starts as time speeds up:
     // the fast part of the drawing is never filmed from close (at a given pace the rings turn just
     // as fast, but the pen crosses fewer pixels per frame). The disc must also always fit.
-    const tPull = t0 + 1.2, pullFor = clamp(0.3 * D, 2.8, 8);
+    const tPull = t0 + (C.pullAt ?? 1.2), pullFor = clamp(0.3 * D, 2.8, 8);
     zoomAt = (t, p) => {
-      const zt = Math.exp(mix(Math.log(zclose * (0.92 + 0.08 * smooth(0, t0 + 0.5, t))), Math.log(SHOT.center.pull), smoother(tPull, tPull + pullFor, t)));
+      const zt = Math.exp(mix(Math.log(zclose * (0.92 + 0.08 * smooth(0, t0 + 0.5, t))), Math.log(C.pull), smoother(tPull, tPull + pullFor, t)));
       return Math.max(1, softmin(zt, fitR(lerpAt(reach, p))));
     };
   } else if (mode === 'edge') {
@@ -1212,7 +1218,11 @@ export class FilmScene {
     gl.uniform1f(U('uMacroW'), mac ? clamp(mac.w, 0, 1) : 0);
     // renderToTexture's rect is in sheet fractions (x of the width, y of the height; the sheet is square)
     if (mac) gl.uniform4f(U('uMacroRect'), mac.rect[0] - 0.5, mac.rect[1] - 0.5, mac.rect[2] - 0.5, mac.rect[3] - 0.5);
-    gl.uniform1f(U('uDeskPeriod'), desk.period);
+    // o.scale (optional): sheet widths per A4 width (210 / sheet mm). A realistic film's big sheet
+    // keeps the desk's veins and the sheet's lift at their real size (the tiling period is held
+    // above ~a third of today's, where the repeat of the bake would start to show)
+    const sc = clamp(o.scale ?? 1, 0.05, 1);
+    gl.uniform1f(U('uDeskPeriod'), desk.period * Math.max(0.34, sc));
     const look = this.look;
     gl.uniform1f(U('uDeskGain'), look.gain);
     gl.uniform1f(U('uRefl'), look.refl);
@@ -1247,7 +1257,7 @@ export class FilmScene {
     gl.uniform1f(U('uHaloLod'), Math.max(0, Math.log2((o.sheet.w || 2048) * 0.012)));
     gl.uniform3f(U('uKey'), 1.0, 0.94, 0.85);          // warm daylight through glass
     gl.uniform3f(U('uAmb'), 0.13, 0.145, 0.17);         // cool fill from the room
-    gl.uniform2f(U('uShadow'), 0.012, 0.018);
+    gl.uniform2f(U('uShadow'), 0.012 * Math.max(0.25, sc), 0.018 * Math.max(0.25, sc));
     gl.uniform1f(U('uShadowAmt'), (dark ? 1.2 : 1.0) * look.shadow);
     gl.uniform1f(U('uExposure'), 1.1);
     gl.drawArrays(gl.TRIANGLES, 0, 3);

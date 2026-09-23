@@ -564,6 +564,66 @@ async function run() {
       S.put(img, c, 0, `${brush.name} light ${az}/${el}`);
     });
     out = S.c;
+  } else if (sheet === 'paperlight') {
+    // Papers (rows) under the named still lights (columns, papers.js LIGHTS): each cell is a 1:1
+    // crop of a `size`-px render (the preview's density; big=4096 for an export's) straddling the
+    // drawing's edge, so blank sheet and drawing show side by side. crop=x,y,w (sheet fractions);
+    // full=1 puts the whole sheet in each cell instead (scaled to cell=px). Each paper gets its
+    // natural medium unless brush= is given; blank=1 draws paper only.
+    const { LIGHTS } = await import('../js/papers.js');
+    const lightIds = (q.get('lights') || 'window,raking,overhead').split(',');
+    const pair = { sketch: 'pencil', cream: 'fineliner', coldpress: 'watercolour', kraft: 'crayon', black: 'gold',
+      chalkboard: 'chalk', blueprint: 'chalk' };
+    const big = +(q.get('big') || size);
+    const [cx, cy, cw] = (q.get('crop') || '0.03,0.36,0.3').split(',').map(Number);
+    const full = q.get('full') === '1';
+    const cell = full ? +(q.get('cell') || 420) : Math.round(cw * big);
+    const S = sheetCanvas(lightIds.length, papers.length, cell);
+    const report = [];
+    for (const [r, paper] of papers.entries()) {
+      const brush = brushById(q.get('brush') || pair[paper.id] || 'fineliner');
+      const ink = q.get('ink') || (paper.dark ? (brush.inks.find(([h]) => inkMode(brush, h, paper).flip) || brush.inks[0])[0] : brush.inks[0][0]);
+      const mode = inkMode(brush, ink, paper);
+      const geom = geometryFor(src, { rings, tech, flip: mode.flip, photo: false });
+      const cv = draw({ size: big, brush, paper, ink, geom, cover: mode.cover });
+      for (const [c, id] of lightIds.entries()) {
+        const L = LIGHTS[id];
+        // ms: median of 5 composites under this light (the light changes only the composite),
+        // synced with a pixel read
+        const gl = renderer.gl, px = new Uint8Array(4), times = [];
+        for (let k = 0; k < 5; k++) {
+          renderer.setLight(L);
+          const t = performance.now();
+          if (q.get('blank') === '1') renderer.renderBlank(); else renderer.render(Infinity);
+          gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+          times.push(performance.now() - t);
+        }
+        const ms = times.sort((a, b) => a - b)[2];
+        let img = cv;
+        if (!full) {
+          img = document.createElement('canvas'); img.width = img.height = cell;
+          img.getContext('2d').drawImage(cv, -cx * big, -cy * big);
+        }
+        // the blank corner at 1:1: mean colour (paper colour check) and luminance std (how much
+        // texture shows at this density), 0..255
+        const cs = Math.round(0.06 * big);
+        const g = document.createElement('canvas'); g.width = g.height = cs;
+        g.getContext('2d').drawImage(cv, -Math.round(0.01 * big), -Math.round(0.01 * big));
+        const d = g.getContext('2d').getImageData(0, 0, cs, cs).data;
+        let sr = 0, sg = 0, sb = 0, sl = 0, sl2 = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          sr += d[i]; sg += d[i + 1]; sb += d[i + 2];
+          const l = 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+          sl += l; sl2 += l * l;
+        }
+        const n = d.length / 4;
+        report.push({ paper: paper.id, light: id, ms: +ms.toFixed(1), corner: [sr / n, sg / n, sb / n].map(v => +v.toFixed(1)),
+          std: +Math.sqrt(Math.max(0, sl2 / n - (sl / n) ** 2)).toFixed(2) });
+        S.put(img, c, r, `${paper.name} · ${brush.name} · ${L.name} @${big}`);
+      }
+    }
+    window.__report = report;
+    out = S.c;
   } else if (sheet === 'simdump') {
     // The wet simulation's state as images: W water, S suspended, P deposited, M moisture,
     // E extent, inj water / pigment / time, phys conductance. brush/paper/upto/settle as usual.

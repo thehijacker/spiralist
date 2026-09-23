@@ -27,6 +27,8 @@ import { toast, announce, bindSeg, reducedMotion, isTouch } from './ui.js';
 import { DESKS, deskById } from './desks.js';
 import { cleanSignature, traceSignature, timeSignature, placeSignature, ensureSignatureFont, signatureFontLoaded, SIGNATURE_MAX } from './signature.js';
 import { shareToX, openXIntent } from './share.js';
+import { lightById } from './papers.js';
+import { formatHand as formatHandSaid } from './real/index.js';
 
 export const FPS = 30;
 export const FPS_CHOICES = [30, 60];
@@ -139,6 +141,148 @@ const easeInOut = x => (x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x));
 const smooth = (a, b, x) => easeInOut((x - a) / (b - a));
 const smoother = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * t * (t * (t * 6 - 15) + 10); };
 
+// ---------------------------------------------------------------------------------- realistic film
+// "True drawing, sped up": the pen runs along the one line in its real order, timed by the hand
+// time the style models (geom.handT), opening at real speed and ramping to a timelapse.
+// Real lengths of the tools (mm) and the sprite calibration: TOOL_LEN.cinematic (0.45 of the
+// film's 210 mm sheet) is a ~140 mm pen, so a tool of L mm on a sheet S mm wide is
+// 0.45 * (L / 140) * (210 / S) sheet widths long.
+const TOOL_MM = { pencil: 175, fineliner: 140, fountain: 140, ballpoint: 145, marker: 135, brush: 190,
+  crayon: 90, charcoal: 110, chalk: 80, neon: 140, goldpen: 140 };
+const REAL_A4 = 210;
+
+/**
+ * The realistic geometry's facts, whatever style made it: { style, sheetMm, toolMm, handSeconds,
+ * lengthM, handT (cumulative hand seconds per point, monotone) } or null when the geometry is not
+ * a realistic one. js/real/index.js (buildReal) gives geom.real + geom.handT; a style module's own
+ * geometry is accepted too (scribble keeps its facts in geom.stats), and a missing handT is derived
+ * from arc length x dwell (every style slows the hand where dwell rises) scaled to the style's total.
+ */
+const realCache = new WeakMap();
+export function realInfo(geom) {
+  const R = geom?.real || (geom?.path?.startsWith?.('real-') ? geom.stats : null);
+  if (!R || !(geom.n > 1)) return null;
+  // (the dialog asks on every refresh: a derived clock is made once per geometry)
+  const hit = realCache.get(geom);
+  if (hit && hit.src === R && hit.T === geom.handT) return hit.info;
+  const info = realFacts(geom, R);
+  realCache.set(geom, { src: R, T: geom.handT, info });
+  return info;
+}
+
+function realFacts(geom, R) {
+  const n = geom.n, data = geom.data;
+  const sheetMm = +R.sheetMm > 0 ? +R.sheetMm : REAL_A4;
+  const toolMm = +R.toolMm > 0 ? +R.toolMm : 0.5;
+  let total = +R.handSeconds > 0 ? +R.handSeconds : +R.handMin > 0 ? R.handMin * 60 : 0;
+  let T = geom.handT && geom.handT.length === n ? geom.handT : null;
+  if (!T) {
+    const mmPerCu = sheetMm * (geom.layout?.r || 0.42);
+    const speed = +R.speedMm > 0 ? +R.speedMm : +R.speedCmS > 0 ? R.speedCmS * 10 : 30;
+    T = new Float64Array(n);
+    for (let i = 1; i < n; i++) {
+      const a = (i - 1) * STRIDE, b = i * STRIDE;
+      const ds = Math.hypot(data[b] - data[a], data[b + 1] - data[a + 1]) * mmPerCu;
+      T[i] = T[i - 1] + ds / speed * Math.max(1, 0.5 * (data[a + 6] + data[b + 6]));
+    }
+    if (total > 0 && T[n - 1] > 0) { const k = total / T[n - 1]; for (let i = 1; i < n; i++) T[i] *= k; }
+  }
+  if (!(total > 0)) total = T[n - 1];
+  if (!(total > 0)) return null;
+  const style = String(R.style || geom.path || '').replace(/^real-/, '');
+  return { style, sheetMm, toolMm, handSeconds: total, lengthM: +R.lengthM || 0, handT: T, preset: R.preset || null };
+}
+
+/**
+ * The film's length in seconds for prefs.film `f`: a realistic drawing of half an hour or more
+ * films for 60 s unless a length was picked by hand (f.lengthChosen), so its sped-up pen stays
+ * readable. The stage transport can use it to preview the same film.
+ */
+export function filmLengthFor(f, geom, realistic = false) {
+  const R = realistic ? realInfo(geom) : null;
+  return R && !f.lengthChosen && R.handSeconds >= 1800 ? 60 : f.length;
+}
+
+/**
+ * Hand time for the counter and the dialog: '12 s', '4 min', '1 h 04 min'. A total is said exactly
+ * as the app's inspector says it (js/real/index.js rounds the minutes), so one drawing never reads
+ * '24 min' there and '23 min' here; withSeconds is the live counter, a clock that counts up.
+ */
+export function formatHand(sec, withSeconds = false) {
+  if (!withSeconds) return formatHandSaid(sec);
+  const s = Math.max(0, Math.round(sec));
+  if (s < 60) return `${s} s`;
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+  if (h) return `${h} h ${String(m).padStart(2, '0')} min`;
+  return withSeconds ? `${m} min ${String(r).padStart(2, '0')} s` : `${m} min`;
+}
+
+/** A speed-up for people: 1x, 2.5x, 38x, 240x, 1200x (two significant figures, no flicker). */
+export function formatSpeed(k) {
+  if (!(k >= 1.25)) return '1×';
+  if (k < 10) { const r = Math.round(k * 2) / 2; return `${r % 1 ? r.toFixed(1) : r}×`; }
+  const p = Math.pow(10, Math.floor(Math.log10(k)) - 1);
+  return `${Math.round(k / p) * p}×`;
+}
+
+/**
+ * The realistic film's clock: hand seconds as a function of film time over the drawing [t0, t1].
+ * The hand starts at real speed (1x) for `open` seconds (the macro close-up, where the ink is seen
+ * going down and soaking in), accelerates continuously (a smooth ramp in log speed: the speed
+ * doubles at a steady rate) to the timelapse speed the film needs, cruises, and eases back down to
+ * 1x for the last `last` seconds, so the final stroke is drawn at a believable pace before the pen
+ * lifts. The peak speed is solved so the hand time adds up to exactly `total`.
+ * Returns { at(t) -> 0..1 of the hand time, hand(t) -> s, speed(t) -> x, peak, avg, open, last }.
+ */
+export function planHandPace({ t0, t1, total, open = 2.6, last = 0.9, hz = 240 }) {
+  const D = Math.max(1e-3, t1 - t0);
+  const n = Math.max(3, Math.ceil(D * hz) + 1), dt = D / (n - 1);
+  // the 1x opening is a tenth of the drawing at most: a 15 s clip must not spend 2.6 s (17%) on a
+  // resting pen over a dot of ink
+  const a = Math.min(open, 0.1 * D), b = Math.min(last, 0.12 * D);
+  const rate = new Float64Array(n);
+  // the hand's first touch: from rest to real speed over a fifth of a second
+  const touch = s => smooth(0, Math.min(0.2, a), s);
+  const fill = L => {
+    const up = clamp(0.5 * L / Math.LN2, 0.6, 0.34 * D), down = clamp(0.32 * L / Math.LN2, 0.5, 0.2 * D);
+    let sum = 0;
+    for (let i = 0; i < n; i++) {
+      const s = i * dt;
+      const l = L * smoother(a, a + up, s) * (1 - smoother(D - b - down, D - b, s));
+      rate[i] = Math.exp(l) * touch(s);
+      if (i) sum += 0.5 * (rate[i - 1] + rate[i]) * dt;
+    }
+    return sum;
+  };
+  let peak = 1;
+  if (fill(0) >= total) {
+    // a drawing shorter than the film at real speed: one steady (slower) pace, still eased in
+    const k = total / fill(0);
+    for (let i = 0; i < n; i++) rate[i] *= k;
+    peak = k;
+  } else {
+    let lo = 0, hi = 1;
+    while (fill(hi) < total && hi < 30) hi *= 1.6;
+    for (let k = 0; k < 40; k++) { const m = 0.5 * (lo + hi); if (fill(m) < total) lo = m; else hi = m; }
+    fill(hi);
+    peak = Math.exp(hi);
+  }
+  const H = new Float64Array(n);
+  for (let i = 1; i < n; i++) H[i] = H[i - 1] + 0.5 * (rate[i - 1] + rate[i]) * dt;
+  const scale = total / (H[n - 1] || 1);
+  for (let i = 0; i < n; i++) { H[i] *= scale; rate[i] *= scale; }
+  const look = (arr, t) => {
+    if (t <= t0) return arr === H ? 0 : arr[0];
+    if (t >= t1) return arr === H ? total : arr[n - 1];
+    const f = (t - t0) / dt, i = Math.min(n - 2, Math.floor(f));
+    return mix(arr[i], arr[i + 1], f - i);
+  };
+  return {
+    at: t => look(H, t) / total, hand: t => look(H, t), speed: t => look(rate, t),
+    peak: peak * scale, avg: total / D, open: a, last: b, total, D,
+  };
+}
+
 /**
  * The key light for renderer.setLight (feature-detected): the renderer's own window light from
  * the upper left (where the scene's light pool and the tool shadows come from), swinging 50
@@ -151,8 +295,9 @@ const smoother = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return
  * cinematic film.
  */
 const LIGHT_AZ0 = Math.atan2(-0.65, -0.55);        // renderer.js LIGHT0: the stills' light
-function lightAt(sweep, rise = 0, glint = null) {
-  let az = LIGHT_AZ0 + 50 * DEG * sweep, el = (40 + 22 * rise) * DEG;
+function lightAt(sweep, rise = 0, glint = null, base = null) {
+  // base (the realistic film): the light the user chose (papers.js LIGHTS), held still
+  let az = (base ? base.azimuth : LIGHT_AZ0) + 50 * DEG * sweep, el = (base ? base.elevation / DEG : 40) * DEG + 22 * rise * DEG;
   if (glint && glint[1] > 0) {
     const [g, w] = glint;
     const gaz = Math.atan2(g[1], g[0]), gel = Math.asin(clamp(g[2], -1, 1));
@@ -162,7 +307,9 @@ function lightAt(sweep, rise = 0, glint = null) {
     el = mix(el, clamp(gel, 30 * DEG, 68 * DEG), w);
   }
   const d = [Math.cos(az) * Math.cos(el), Math.sin(az) * Math.cos(el), Math.sin(el)];
-  return Object.assign(d, { x: d[0], y: d[1], z: d[2], azimuth: az, elevation: el, sweep, valueOf: () => az });
+  const L = Object.assign(d, { x: d[0], y: d[1], z: d[2], azimuth: az, elevation: el, sweep, valueOf: () => az });
+  if (base) { L.intensity = base.intensity; L.warmth = base.warmth; }
+  return L;
 }
 
 // zero-phase Gaussian smoothing of a sampled track (edges held)
@@ -225,6 +372,19 @@ export class FilmComposer {
     this.fps = o.fps || FPS;
     this.frames = Math.round(this.length * this.fps);
     this.signature = cleanSignature(o.signature);
+    // o.realistic (doc.mode === 'realistic'): true drawing, sped up. Only a geometry that carries
+    // its real facts (realInfo) can be filmed that way; anything else films as it always has.
+    // (the app's renderState says so itself: state.mode, state.light)
+    this.real = (o.realistic ?? o.state?.mode === 'realistic') ? realInfo(o.state?.geom) : null;
+    if (this.real) {
+      // no photo reveal, no fades: only what a camera over a real desk would record
+      this.reveal = false;
+      this.pacing = 'natural';
+      this.counter = o.counter !== false;
+      this.realScale = REAL_A4 / this.real.sheetMm;
+      const L = o.light ?? o.state?.light;
+      this.baseLight = L && typeof L === 'object' && Number.isFinite(L.azimuth) ? L : lightById(L || 'window');
+    } else { this.counter = false; this.realScale = 1; }
     this._setStyle(o.style === 'cinematic' && o.sceneLib ? 'cinematic' : 'flat');
     const { side, cx, cy } = sheetPlace(this.format, this.W, this.H, this.style);
     this.side = Math.round(side / 2) * 2;
@@ -249,6 +409,14 @@ export class FilmComposer {
     this.tReveal = this.tDone + T.lift + this.hold;
     this.toolLen = TOOL_LEN[style];
     this.restAt = this.tDone + T.lift + 0.5;       // replaced by the camera plan in cinematic
+    if (this.real) {
+      // the tool at its real length on this sheet: a charcoal stick on a 1 m sheet looks small
+      const mm = TOOL_MM[this.state?.brush?.tool] || 140;
+      this.toolLen = TOOL_LEN[style] * (mm / 140) * this.realScale;
+      // the pen follows the hand's own clock (both styles)
+      this.hand = planHandPace({ t0: this.t0, t1: this.t1, total: this.real.handSeconds });
+      this.pace = this.hand;
+    }
   }
 
   prepare() {
@@ -264,6 +432,9 @@ export class FilmComposer {
     r.setLayout(s.layout);
     r.setPaper(s.paper, s.seed);
     r.setStyle(s);
+    // the paper's grain, fibres and grit at their real millimetre size on the realistic film's
+    // sheet (the shared renderer goes back to the A4 default for any other film)
+    if (typeof r.setSheetMm === 'function') r.setSheetMm(this.real ? this.real.sheetMm : REAL_A4);
     // wet media advance with the drawing's pacing time: the renderer must know which one plays
     if (typeof r.setPacing === 'function') r.setPacing(this.pacing);
     // the cinematic pen is paced to the shot, so the pace comes before the pen's track
@@ -336,9 +507,25 @@ export class FilmComposer {
   /** Fractional point index of the pen at time t (s). */
   _fi(t) {
     const { geom } = this.state;
-    if (this.pace) return indexAt(geom, this.pace.at(t), this.pacing);
+    if (this.pace) return this._idx(this.pace.at(t));
     const u = (t - this.t0) / this.D;
     return u <= 0 ? 0 : u >= 1 ? geom.n - 1 : indexAt(geom, drawProgress(u, this.D, 0.5, 0.6), this.pacing);
+  }
+
+  /**
+   * Fractional point index at progress p: along the pacing table, or (realistic) at that share of
+   * the hand time, found in geom.handT.
+   */
+  _idx(p) {
+    const { geom } = this.state;
+    if (!this.real) return indexAt(geom, p, this.pacing);
+    const T = this.real.handT, n = geom.n, h = clamp(p, 0, 1) * T[n - 1];
+    if (h <= T[0]) return 0;
+    if (h >= T[n - 1]) return n - 1;
+    let lo = 0, hi = n - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (T[m] <= h) lo = m; else hi = m; }
+    const d = T[hi] - T[lo];
+    return lo + (d > 0 ? (h - T[lo]) / d : 0);
   }
 
   /** Circle units -> px in the flat framing (dev/tools_film.js places its crops with it). */
@@ -362,7 +549,7 @@ export class FilmComposer {
     const { geom } = this.state;
     // spirals grow from the centre (or close in from the rim); every other path (maze, wander,
     // contour) starts where the user pointed and roams, so the camera follows it
-    const spiral = !geom.path || geom.path === 'spiral';
+    const spiral = !geom.path || geom.path === 'spiral' || (!!this.real && geom.path === 'real-squiggle');
     return !spiral ? 'follow' : geom.start === 'edge' ? 'edge' : 'center';
   }
 
@@ -385,6 +572,18 @@ export class FilmComposer {
     if (!tr || !tr.strokes.length) return null;
     const s = this.state, L = s.layout;
     const place = placeSignature(tr, { x: L.cx - 0.5, y: L.cy - 0.5, r: L.r, square: s.shape === 'square' });
+    if (this.real) {
+      // a name keeps its handwritten size on a big sheet (as on A4), but never under ~9 widths of
+      // the tool writing it (a stick needs bigger letters); shrunk toward its lower-right corner
+      const R = this.real, now = place.em * R.sheetMm;
+      const want = Math.max(place.em * REAL_A4, 9 * R.toolMm);
+      if (want < now) {
+        const right = place.x + tr.width * place.em, bottom = place.y + tr.bottom * place.em;
+        place.em *= want / now;
+        place.x = right - tr.width * place.em;
+        place.y = bottom - tr.bottom * place.em;
+      }
+    }
     const tm = timeSignature(tr, this.signW);
     const pen = SIGN_PEN[s.brush?.id] || SIGN_PEN.fineliner;
     const brushy = s.brush?.id === 'brush' || s.brush?.id === 'watercolour';
@@ -405,6 +604,8 @@ export class FilmComposer {
       const q = clamp(tm.speed[k] / vRef, 0.3, 1.8);
       tone[k] = clamp(0.8 - 0.25 * (q - 1), 0.5, 0.95);
       w[k] = pen.mm / SHEET_MM / L.r * fIn * fOut * (brushy ? clamp(1.2 - 0.3 * (q - 1), 0.75, 1.35) : 1);
+      // the realistic film signs with the very tool that drew: one fixed width, no swell
+      if (this.real) { w[k] = this.real.toolMm / this.real.sheetMm / L.r; tone[k] = 0.8; }
       // the nib rests a moment where a stroke starts (wet media leave a small blot there)
       dwell[k] = 1 + 0.6 * Math.exp(-a / 0.25) + 0.25 * Math.exp(-b / 0.2);
     }
@@ -499,7 +700,7 @@ export class FilmComposer {
     const K = PATH_SAMPLES, data = geom.data;
     const x = new Float64Array(K), y = new Float64Array(K), S = new Float64Array(K), turns = new Float64Array(K);
     for (let k = 0; k < K; k++) {
-      const fi = indexAt(geom, k / (K - 1), this.pacing);
+      const fi = this._idx(k / (K - 1));
       const h = headAt(geom, fi);
       [x[k], y[k]] = this._world(h.x, h.y);
       const i = Math.min(geom.n - 1, Math.floor(fi)), j = Math.min(geom.n - 1, i + 1);
@@ -520,7 +721,7 @@ export class FilmComposer {
     if (macro) {
       let n = 0, ink = 0;
       for (let k = 0; k < K && S[k] - S[0] < 0.12; k++) {
-        const i = Math.min(geom.n - 1, Math.floor(indexAt(geom, k / (K - 1), this.pacing)));
+        const i = Math.min(geom.n - 1, Math.floor(this._idx(k / (K - 1))));
         // on-screen width at the macro (px) weighted by pressure: a firm line or a wide one reads
         // (a wave's pen is the same all along; its tone only moves the wave)
         const press = geom.technique === 'wave' ? 1 : Math.sqrt(clamp(data[i * STRIDE + 4], 0, 1));
@@ -530,7 +731,24 @@ export class FilmComposer {
       this.macroInk = n ? ink / n : 0;
       macro = this.macroInk >= 1.2;
     }
-    this.intent = lib.shotIntent({ mode, t0: this.t0, t1: this.t1, art: this.art, frame: this.frame, safe: this.safe, path: { x, y }, macro });
+    let shot;
+    if (this.real) {
+      // Shot sizes in millimetres of paper across the frame's short side, so a 1 m sheet is filmed
+      // the way a camera over it would be: the macro sees ~45 mm around a fine pen (more around a
+      // broad stick: its line would fill the frame), the follow shot ~2.6x and ~4x that.
+      const R = this.real, spanMm = R.sheetMm * Math.min(this.W, this.H) / this.side;
+      const field = clamp(45 * Math.sqrt(R.toolMm / 0.4), 36, 150);
+      const z = mm => Math.max(1.1, spanMm / mm);
+      const open = this.hand.open;
+      if (macro) macro = { zoom: clamp(z(field), 3.5, 14), hold: Math.max(0.6, open - 0.5), ease: clamp(0.3 * this.D, 1.2, 2.6) };
+      shot = {
+        center: { close: z(field * 2.2), pull: Math.min(z(field * 2.2), z(field * 4.5)), pullAt: open + 0.3 },
+        follow: { close: z(field * 2.6), mid: Math.min(z(field * 2.6), z(field * 4)), hold: open, ease: clamp(0.25 * this.D, 1.5, 3) },
+      };
+    }
+    this.intent = lib.shotIntent({ mode, t0: this.t0, t1: this.t1, art: this.art, frame: this.frame, safe: this.safe, path: { x, y }, macro, shot });
+    // the realistic pen keeps the hand's clock; the camera follows it (no pace for the shot)
+    if (this.real) { this.pace = this.hand; return; }
     // a spiral's pen is held back by how fast it turns (frames per ring); a maze's, wander's or
     // contour's by how fast it crosses the screen
     const spiral = mode !== 'follow';
@@ -619,6 +837,17 @@ export class FilmComposer {
    * lifted, carried to the desk beside the sheet and laid down there for the rest of the film (or,
    * where the frame has no room for it, carried out of frame).
    */
+  /**
+   * Realistic films: a real arm, not a plotter carriage. The elbow stays low right, so the pen lies
+   * further round to the right when the tip is on the left of the sheet: 12 deg across A4, up to
+   * 24 deg on a big sheet, where the whole arm swings. Degrees added to the pen's azimuth.
+   */
+  _arm(fi) {
+    if (!this.real) return 0;
+    const u = clamp((headAt(this.state.geom, fi).x + 1) / 2, 0, 1);
+    return (12 + 12 * clamp((this.real.sheetMm - 210) / 800, 0, 1)) * (0.5 - u);
+  }
+
   _poseCinematic(t) {
     const { geom } = this.state;
     const T = this.tl;
@@ -638,12 +867,16 @@ export class FilmComposer {
       x += E.dir[0] * off + E.dir[1] * off * 0.18 * Math.sin(Math.PI * e);
       y += E.dir[1] * off - E.dir[0] * off * 0.18 * Math.sin(Math.PI * e);
       lift = Math.max(bob * e, Math.pow(1 - e, 1.3));
+      angle += this._arm(0);   // the arm arrives already turned for the first stroke
     } else if (t <= this.t1) {
-      [x, y] = at(this._fi(t));
+      const fi = this._fi(t);
+      [x, y] = at(fi);
       lift = bob;
+      angle += this._arm(fi);
     } else if (this.sign && t <= this.tDone) {
       [x, y] = this._tipAt(t);
       lift = this._signLift(t, bob);
+      angle += this._arm(geom.n - 1);   // the signing hand keeps the arm where the drawing ended
     } else {
       const k = clamp((t - this.tDone) / T.lift, 0, 1);
       const [ex, ey] = this._tipAt(this.tDone);
@@ -657,7 +890,7 @@ export class FilmComposer {
         x = mix(ex, R.x, m) + dy / d * bow;
         y = mix(ey, R.y, m) - dx / d * bow;
         lift = Math.max(bob * (1 - smooth(0, 0.2, k)), smooth(0, 0.25, k)) * (1 - smooth(0.66, 0.97, k));
-        angle = mix(TOOL_ANGLE + lean * (1 - leanOff), R.angle, smoother(0.15, 0.85, k));
+        angle = mix(TOOL_ANGLE + lean * (1 - leanOff) + this._arm(geom.n - 1), R.angle, smoother(0.15, 0.85, k));
         elev = mix(HOLD_ELEV, 0, smooth(0.5, 0.97, k));
         // once down it lies still: the hand's micro-wobble stops where it is
         const tDown = this.tDone + T.lift;
@@ -668,7 +901,7 @@ export class FilmComposer {
         x = ex + E.dir[0] * e * E.dist;
         y = ey + E.dir[1] * e * E.dist;
         lift = Math.min(1, bob + (1 - bob) * smooth(0, 0.5, k));
-        angle = TOOL_ANGLE + lean * (1 - leanOff);
+        angle = TOOL_ANGLE + lean * (1 - leanOff) + this._arm(geom.n - 1);
       }
     }
     return { x, y, lift, alpha: 1, angle, sway, elev };
@@ -687,7 +920,7 @@ export class FilmComposer {
     const s = this.state;
     const opts = { color: s.photoColor ? '#8a5a44' : s.ink, lift: pose.lift, alpha: pose.alpha, angle: pose.angle, sway: pose.sway };
     try {
-      const K = 4, shutter = 0.2 / this.fps;
+      const K = 4, shutter = this._shutter(t, 0.2 / this.fps);
       const pts = [];
       for (let k = 0; k < K; k++) {
         const p = k === K - 1 ? pose : this.toolPose(t - shutter * (1 - k / (K - 1)));
@@ -819,6 +1052,9 @@ export class FilmComposer {
     // the cinematic story keeps it smaller and lower, toward the near edge of the desk: in the
     // tilted shots it is then mostly out of frame or soft, instead of competing with the drawing
     if (this.style === 'cinematic' && format === 'story') { size = W * 0.26; x = W * 0.14; y = py + side + H * 0.075; }
+    // a realistic film's big sheet: the print keeps its real size (it lies where it would, its
+    // corner as near the sheet as before)
+    if (this.realScale < 1) { const s2 = size * clamp(this.realScale * 1.15, 0.2, 1); x += (size - s2) * 0.5; y += (size - s2) * 0.15; size = s2; }
     return { size, cx: x + size / 2, cy: y + size / 2, rot };
   }
 
@@ -900,6 +1136,7 @@ export class FilmComposer {
       g.restore();
     }
     this._drawTool(g, t, { toCtx: (x, y) => [px + (x + 0.5) * side, py + (y + 0.5) * side], size: side * this.toolLen });
+    if (this.counter) this._drawCounter(g, t);
   }
 
   // ---------------------------------------------------------------- cinematic
@@ -1026,6 +1263,9 @@ export class FilmComposer {
       const artBottom = this.py + (this.state.layout.cy + this.state.layout.r) * side;
       tip = [W / 2 - L * 0.42, (artBottom + yb) / 2 + side * 0.004]; ang = 93;
     }
+    // a realistic big sheet's small tool is put down where a hand would: just off the sheet's lower
+    // edge, under the right half of the drawing (not far out on the desk, where it would be lost)
+    if (this.realScale < 0.75 && this.format !== 'wide') { tip = [this.px + side * 0.62, yb + Math.max(L * 0.35, side * 0.035)]; ang = 99; }
     const back = [tip[0] + Math.sin(ang * DEG) * L, tip[1] + Math.cos(ang * DEG) * L];
     const fits = back[0] < W - side * 0.02 && back[1] > 0 && tip[1] < H - side * 0.03;
     if (fits) {
@@ -1113,10 +1353,11 @@ export class FilmComposer {
   _hooks(t, view = null, eye = null) {
     const r = this.renderer, T = this.tl;
     const settle = smooth(this.tDone, this.tDone + T.lift + T.hold - (this.signW ? T.signHoldCut : 0), t);
-    const sweep = smooth(this.tDone + T.lift, this.length, t);
+    // (the realistic film's light is the one the user chose, and it stays where it is)
+    const sweep = this.real ? 0 : smooth(this.tDone + T.lift, this.length, t);
     // the light rises as the pen is put down, so the ink is still wet when a glint can first show
     // on the straight-down final framing, and the gloss is seen to go as it dries (settle)
-    const rise = view ? smooth(this.tDone, this.tDone + T.lift + 0.8, t) : 0;
+    const rise = view && !this.real ? smooth(this.tDone, this.tDone + T.lift + 0.8, t) : 0;
     // the macro's glint light, and a lighter touch of it while the fresh signature is filmed
     let glint = null;
     if (view) {
@@ -1127,7 +1368,7 @@ export class FilmComposer {
     let key = settle.toFixed(3);
     if (typeof r.setTime === 'function') { r.setTime(t); key += `|${t}`; }
     if (typeof r.setLight === 'function') {
-      const L = lightAt(sweep, rise, glint);
+      const L = lightAt(sweep, rise, glint, this.real ? this.baseLight : null);
       if (view) L.view = view;
       if (eye) L.eye = eye;
       r.setLight(L);
@@ -1173,7 +1414,8 @@ export class FilmComposer {
     const M = this.intent?.macro;
     if (!M) return;
     const r = this.renderer;
-    const D = Math.min(8192, Math.ceil(M.zoom * this.side * 1.25 / 64) * 64);
+    // (a realistic big sheet's macro sees a few cm of a metre-wide sheet: it needs the finer density)
+    const D = Math.min(this.real ? 12288 : 8192, Math.ceil(M.zoom * this.side * 1.25 / 64) * 64);
     let ext = 0;
     for (let t = 0; t <= this.plan.tMacroEnd + 0.1; t += 1 / 30) {
       if (this._macroNeed(t, true) <= 0) continue;
@@ -1248,6 +1490,8 @@ export class FilmComposer {
     const t = i / this.fps;
     const cam = this.plan.at(t);
     const basis = lib.cameraBasis(cam, W, H, side);
+    // the lens's real aperture on a realistic film's big sheet (scene.lens reads it)
+    if (this.real) basis.ap = clamp(this.realScale, 0.2, 1);
     // toward the camera from the point in focus (paper axes: x right, y down, z up), and the camera
     // itself in sheet widths from the sheet's top-left corner: every pixel then sees the lens from
     // its own angle, so a wet line or a gold flake glints locally and the glint travels as it moves
@@ -1255,11 +1499,96 @@ export class FilmComposer {
     const eye = [basis.C[0] + 0.5, basis.C[1] + 0.5, basis.C[2]];
     const { sheet, sweep, macro } = this._sheet(t, v.map(c => c / vn), eye);
     if (!sheet) throw Object.assign(new Error('The graphics context was lost'), { code: 'encode' });
-    this.scene.render({ sheet, basis, focus: [cam.fx, cam.fy], wipe: this._wipe(t), light: sweep, time: t, macro });
+    this.scene.render({ sheet, basis, focus: [cam.fx, cam.fy], wipe: this._wipe(t), light: sweep, time: t, macro, scale: this.realScale });
     g.drawImage(this.canvas, 0, 0, W, H);
     if (this.showTool && this.tools) {
       try { this._drawToolCinematic(g, t, basis, [cam.fx, cam.fy]); } catch (e) { console.warn(e); }
     }
+    if (this.counter) this._drawCounter(g, t);
+  }
+
+  /**
+   * The realistic film's clock, set small in a bottom corner like a timecode burnt in by the
+   * camera: the hand time drawn so far and the speed-up ("1 h 04 min · 240×"), digits in fixed
+   * cells so nothing jitters as they count. When the pen lifts it gives way to the end card line,
+   * "3 h 12 min of drawing in 30 s", in the same corner.
+   */
+  _drawCounter(g, t) {
+    const { W, H } = this, H0 = this.hand;
+    if (!H0) return;
+    const k = Math.min(W, H), m = Math.round(0.045 * k);
+    // (a story: below where the pen is laid down, above the apps' reply bar)
+    const x1 = W - m, y1 = this.format === 'story' ? Math.round(H * 0.855) : H - m;
+    const signing = this.sign && t > this.t1 ? clamp(t - this.tS0, 0, this.signW) : 0;
+    const hand = H0.hand(t) + signing;
+    const drawing = t >= this.t0 && t < this.tDone;
+    const speed = t < this.t1 ? H0.speed(t) : 1;
+    const total = H0.total + (this.sign ? this.signW : 0);
+    const endAt = this.tDone + 0.35;
+    const e = smooth(endAt, endAt + 0.5, t);
+    g.save();
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.textBaseline = 'alphabetic';
+    g.shadowColor = 'rgba(0,0,0,.45)';
+    g.shadowBlur = k * 0.012;
+    g.shadowOffsetY = k * 0.0015;
+    const cells = (text, x, y, px, color) => {
+      // right-aligned, each digit in a cell as wide as the widest digit (tabular figures)
+      const dw = g.measureText('0').width;
+      let w = 0;
+      for (const ch of text) w += /\d/.test(ch) ? dw : g.measureText(ch).width;
+      let cx = x - w;
+      g.fillStyle = color;
+      for (const ch of text) {
+        const cw = /\d/.test(ch) ? dw : g.measureText(ch).width;
+        g.fillText(ch, cx + (cw - g.measureText(ch).width) / 2, y);
+        cx += cw;
+      }
+      return w;
+    };
+    // a soft scrim behind the type, as a colourist would pull down a corner: legible over white
+    // paper and dark marble alike, with no hard-edged box (the blur of a shape drawn off-canvas and
+    // shadow-cast into place, which every 2D canvas supports)
+    const plate = (x0, x1p, py0, py1, a) => {
+      const h = py1 - py0, off = 4 * (W + H);
+      g.save();
+      g.globalAlpha = a;
+      g.shadowColor = 'rgba(14,12,10,.5)';
+      g.shadowBlur = h * 0.8;
+      g.shadowOffsetX = off; g.shadowOffsetY = 0;
+      g.fillStyle = '#000';
+      g.beginPath();
+      if (g.roundRect) g.roundRect(x0 - off, py0, x1p - x0, h, h / 2); else g.rect(x0 - off, py0, x1p - x0, h);
+      g.fill();
+      g.restore();
+    };
+    if (e < 1 && t >= this.t0 - 0.2) {
+      const px = Math.round(0.024 * k);
+      const a = (1 - e) * smooth(this.t0 - 0.2, this.t0 + 0.2, t);
+      g.font = `500 ${px}px Geist, "Helvetica Neue", Arial, sans-serif`;
+      const sp = drawing || t < this.t0 ? `  ·  ${formatSpeed(speed)}` : '';
+      const main = formatHand(hand, speed < 40);
+      // measure first (same cells as drawn), so the plate fits the text
+      const dw = g.measureText('0').width;
+      const wOf = s => [...s].reduce((w, ch) => w + (/\d/.test(ch) ? dw : g.measureText(ch).width), 0);
+      const tw = wOf(sp) + wOf(main), padX = px * 0.75, padY = px * 0.5;
+      plate(x1 - tw - padX, x1 + padX, y1 - px * 0.95 - padY, y1 + px * 0.25 + padY, a);
+      g.globalAlpha = a;
+      const w = cells(sp, x1, y1, px, 'rgba(255,250,242,.7)');
+      cells(main, x1 - w, y1, px, 'rgba(255,250,242,.96)');
+    }
+    if (e > 0) {
+      const px = Math.round(0.034 * k);
+      g.font = `italic 400 ${px}px "Instrument Serif", Georgia, serif`;
+      const text = `${formatHand(total)} of drawing in ${Math.round(this.length)} s`;
+      const tw = g.measureText(text).width, padX = px * 0.6, padY = px * 0.34;
+      plate(x1 - tw - padX, x1 + padX, y1 - px * 0.78 - padY, y1 + px * 0.24 + padY, e);
+      g.globalAlpha = e;
+      g.textAlign = 'right';
+      g.fillStyle = 'rgba(255,250,242,.97)';
+      g.fillText(text, x1, y1);
+    }
+    g.restore();
   }
 
   /**
@@ -1275,6 +1604,16 @@ export class FilmComposer {
    *   length with the scene's own thin lens (the nib, on the paper, is as sharp as the line).
    * The sprite is painted once per frame; the streak, the nib and the blur are made from it.
    */
+  /**
+   * Shutter time (film seconds) for the tool's motion blur. A realistic film is a timelapse: a
+   * camera over a real desk exposes each frame for ~1/60 s of the hand's own motion, so at 500x
+   * the pen is crisp and jumps between frames instead of smearing into a ghost across the sheet.
+   */
+  _shutter(t, base) {
+    if (!this.real || !this.hand) return base;
+    return Math.min(base, (1 / 60) / Math.max(1, this.hand.speed(t)));
+  }
+
   _drawToolCinematic(g, t, basis, focus) {
     const lib = this.sceneLib, tools = this.tools, s = this.state;
     const pose = this.toolPose(t);
@@ -1284,7 +1623,7 @@ export class FilmComposer {
     const kind = s.brush.tool;
     const opts = { color: s.photoColor ? '#8a5a44' : s.ink, lift: pose.lift, angle: pose.angle, sway: pose.sway };
     // the tip's path over the shutter, in device px, oldest first
-    const K = 14, shutter = 0.5 / this.fps;
+    const K = 14, shutter = this._shutter(t, 0.5 / this.fps);
     const path = [];
     let trail = 0;
     for (let k = 0; k < K; k++) {
@@ -1547,7 +1886,8 @@ export function createFilmDialog(app) {
       if (preview) preview.setDesk(v); else refresh();
     }),
     format: bindSeg(dlg.querySelector('[data-film="format"]'), f.format, v => { f.format = v; app.persist(); reprobe(); }),
-    length: bindSeg(dlg.querySelector('[data-film="length"]'), String(f.length), v => { f.length = +v; app.persist(); refresh(); app.refreshTransport(); }),
+    // (a length picked by hand is kept even where a realistic drawing would default to 60 s)
+    length: bindSeg(dlg.querySelector('[data-film="length"]'), String(f.length), v => { f.length = +v; f.lengthChosen = true; app.persist(); refresh(); app.refreshTransport(); }),
     style: bindSeg(dlg.querySelector('[data-film="style"]'), f.style, v => {
       f.style = v;
       // 60 fps is the cinematic default; follow the style until the rate is chosen by hand
@@ -1558,9 +1898,11 @@ export function createFilmDialog(app) {
     pacing: bindSeg(dlg.querySelector('[data-film="pacing"]'), app.prefs.pacing, v => { app.prefs.pacing = v; app.persist(); refresh(); app.refreshTransport(); }),
     start: bindSeg(dlg.querySelector('[data-film="start"]'), app.doc.line.start, v => { app.doc.line.start = v; app.persist(); refresh(); app.refreshTransport(); }),
   };
-  for (const key of ['showTool', 'polaroid', 'reveal']) {
+  for (const key of ['showTool', 'polaroid', 'reveal', 'counter']) {
     const el = dlg.querySelector(`[data-film="${key}"]`);
-    el.checked = !!f[key];
+    if (!el) continue;
+    // the realistic film's clock is on unless turned off
+    el.checked = key === 'counter' ? f.counter !== false : !!f[key];
     el.addEventListener('change', () => { f[key] = el.checked; app.persist(); refresh(); app.refreshTransport(); });
   }
   // Sign it: the name is kept as typed; the preview restarts once typing pauses (a new signature
@@ -1583,11 +1925,17 @@ export function createFilmDialog(app) {
   signEl.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); $('filmGo').focus(); } });
 
   function currentFormat() { return FORMATS[f.format] || FORMATS.square; }
+  // Realistic mode (doc.mode, with a geometry that carries its hand time): the film is the true
+  // drawing, sped up
+  const realNow = () => (app.doc?.mode === 'realistic' ? realInfo(app.geom) : null);
+  const filmLength = () => filmLengthFor(f, app.geom, app.doc?.mode === 'realistic');
   // the sheet's width in the full-size film's final frame (the fine-line guard is judged on it)
   function filmSide() { const fmt = currentFormat(); return sheetPlace(f.format, fmt.w, fmt.h, f.style).side; }
   const fps = () => (FPS_CHOICES.includes(+f.fps) ? +f.fps : FPS);
 
   function filmGeometry(side) {
+    // a realistic drawing is filmed as it is: its line is the real tool's width on the real sheet
+    if (realNow()) { $('filmGuard').hidden = true; ringsOverride = null; return app.geom; }
     // Fine-line guard: below ~4 output px between rings, H.264 and social apps smear the line.
     const rings = app.doc.line.rings;
     const maxRings = Math.floor((side * app.layout.r) / 4.5);
@@ -1621,8 +1969,9 @@ export function createFilmDialog(app) {
   function composerFor(W, H, live = false) {
     return new FilmComposer({
       renderer: filmStage().renderer, desk: f.desk, live,
-      W, H, format: f.format, length: f.length, showTool: f.showTool, polaroid: f.polaroid, reveal: f.reveal,
+      W, H, format: f.format, length: filmLength(), showTool: f.showTool, polaroid: f.polaroid, reveal: f.reveal && !realNow(),
       pacing: app.prefs.pacing, state: snapshotState(filmSide()),
+      realistic: !!realNow(), counter: f.counter !== false, light: app.doc?.real?.light,
       drawPhoto: app.photo ? (g, cx, cy, R) => app.drawPhotoInCircle(g, cx, cy, R) : null,
       tools: modules?.tools, sceneLib: modules?.scene, style: f.style,
       // the pace and the camera are planned in seconds, so the preview runs the film's own frame
@@ -1638,15 +1987,26 @@ export function createFilmDialog(app) {
     const rate = fps();
     const mbps = (fmt.w * fmt.h >= 1920 * 1080 ? 12 : fmt.h === 1350 ? 9 : 8) * Math.pow(rate / 30, 0.6);
     // a moving camera changes every pixel of every frame, so it uses nearly all of its bitrate
-    const mb = Math.round(mbps * f.length / 8 * (f.style === 'cinematic' ? 0.92 : 0.7));
+    const len = filmLength();
+    const mb = Math.round(mbps * len / 8 * (f.style === 'cinematic' ? 0.92 : 0.7));
     const engine = modules?.probe;
     const container = engine?.webcodecs ? 'MP4' : engine?.recorder ? engine.recorder.ext.toUpperCase() : null;
     $('filmSummary').textContent = container
       ? `${container} · ${fmt.w} × ${fmt.h} · ${rate} fps · about ${Math.max(1, mb)} MB`
       : `${fmt.w} × ${fmt.h} · ${rate} fps`;
-    $('filmGoLabel').textContent = `Film ${f.length}-second video`;
+    $('filmGoLabel').textContent = `Film ${len}-second video`;
+    // realistic: how long the drawing takes by hand, and how much the film speeds it up
+    const R = realNow(), hand = $('filmHand');
+    if (hand) {
+      hand.hidden = !R;
+      if (R) {
+        const D = drawSeconds(len, false, f.style, signSeconds(f.signature));
+        const avg = R.handSeconds / Math.max(1, D);
+        hand.textContent = `About ${formatHand(R.handSeconds)} of drawing by hand · shown ${avg >= 1.25 ? `about ${formatSpeed(avg)} faster` : 'at real speed'} in ${len} s`;
+      }
+    }
     const note = $('filmEngineNote');
-    if (engine && !engine.webcodecs && engine.recorder) note.textContent = `This browser records in real time — filming takes ${f.length} s. Keep this tab open.`;
+    if (engine && !engine.webcodecs && engine.recorder) note.textContent = `This browser records in real time — filming takes ${len} s. Keep this tab open.`;
     else if (engine && !engine.webcodecs && !engine.recorder) note.textContent = 'Video needs a newer browser — image export still works.';
     else note.textContent = '';
     $('filmGo').disabled = !!(engine && !engine.webcodecs && !engine.recorder);
@@ -1712,6 +2072,11 @@ export function createFilmDialog(app) {
     segs.start.set(app.doc.line.start);
     segs.style.set(f.style);
     segs.fps.set(String(fps()));
+    segs.length.set(String(filmLength()));
+    // realistic: no photo reveal, no pace or start to choose (the hand's own clock and order),
+    // and the drawing clock to show or not
+    const R = !!realNow();
+    for (const [id, hide] of [['filmRevealRow', R], ['filmMore', R], ['filmCounterRow', !R]]) { const el = $(id); if (el) el.hidden = hide; }
     summary();
     filmGeometry(filmSide());
     if (!$('filmSetup').hidden) startPreview();
@@ -1843,6 +2208,9 @@ export function createFilmDialog(app) {
         composeMsPerFrame: +(composer.stats.ms / Math.max(1, composer.stats.frames)).toFixed(2),
         totalMs: Math.round(performance.now() - t0), encoder: res.perFrameMs, codec: res.codec, engine: res.engine,
         sign: composer.sign ? { t0: composer.tS0, t1: composer.tS1, em: +composer.sign.em.toFixed(4), font: composer.sign.font, text: composer.sign.text } : null,
+        real: composer.real ? { style: composer.real.style, sheetMm: composer.real.sheetMm, toolMm: composer.real.toolMm,
+          handSeconds: Math.round(composer.real.handSeconds), peak: Math.round(composer.hand.peak), avg: Math.round(composer.hand.avg),
+          open: composer.hand.open, toolLen: +composer.toolLen.toFixed(4), mode: composer.intent?.mode || null, length: composer.length } : null,
       };
       result = res;
       showResult(res, W, H);
@@ -1878,7 +2246,7 @@ export function createFilmDialog(app) {
 
   function fileBase() {
     const name = (app.photo?.name || 'drawing').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 24) || 'drawing';
-    return `spiralist-${name}-${app.lookName().toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${f.length}s`;
+    return `spiralist-${name}-${app.lookName().toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${filmLength()}s`;
   }
 
   function showResult(res, W, H) {

@@ -106,6 +106,8 @@
         <svg class="ic" aria-hidden="true"><use href="#i-frame"/></svg><span>Frame</span></button>
       <button class="pill-btn" id="btnCompare" type="button" title="Hold to compare with the photo (\)">
         <svg class="ic" aria-hidden="true"><use href="#i-compare"/></svg><span>Compare</span></button>
+      <button class="pill-btn" id="btnLoupe" type="button" title="Look into the paper: scroll, pinch or double-click the sheet (+ −, 0 fits)" aria-pressed="false">
+        <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 5.5 5.5M10.5 8v5M8 10.5h5"/></g></svg><span>Loupe</span></button>
     </div>
 
     <div class="sheet-wrap" id="sheetWrap">
@@ -113,6 +115,19 @@
         <canvas id="art" class="art" role="img" aria-label="Blank sheet of paper"></canvas>
         <canvas id="overlay" class="overlay" aria-hidden="true"></canvas>
         <div class="busy" id="busy" hidden><span class="spinner" aria-hidden="true"></span></div>
+        <div class="real-scale" id="realScale" hidden><span class="real-scale-rule"><i></i><b id="realScaleLen">5 cm</b></span><span class="real-scale-txt" id="realScaleTxt"></span></div>
+        <!-- loupe: shown while zoomed; the scale bar is real paper (the sheet's true width) -->
+        <div class="loupe-bar" id="loupeBar" role="toolbar" aria-label="Zoom" hidden>
+          <button class="loupe-btn" type="button" id="loupeOut" aria-label="Zoom out" title="Zoom out (−)">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+          <div class="loupe-badge" aria-hidden="true">
+            <span class="loupe-z" id="loupeZ">1×</span>
+            <span class="loupe-scale"><i class="loupe-rule" id="loupeRule"></i><span id="loupeMm">1 mm</span></span>
+          </div>
+          <button class="loupe-btn" type="button" id="loupeIn" aria-label="Zoom in" title="Zoom in (+)">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 12h12M12 6v12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+          <button class="loupe-btn loupe-fit" type="button" id="loupeFit" title="Whole sheet (0)">Fit</button>
+        </div>
       </div>
       <!-- framing controls replace the transport while framing -->
       <div class="framebar" id="frameBar" hidden role="toolbar" aria-label="Framing">
@@ -185,15 +200,33 @@
 
   <!-- ─────────── Inspector ─────────── -->
   <aside class="inspector" id="inspector" aria-label="Settings">
+    <div class="mode-bar">
+      <div class="seg mode-seg" data-bind="mode" role="radiogroup" aria-label="Mode">
+        <button role="radio" type="button" data-v="artistic" title="Artistic: the line swells and wiggles freely (M)">Artistic</button>
+        <button role="radio" type="button" data-v="realistic" title="Realistic: one real pen on a real sheet, drawable by hand (M)">Realistic</button>
+      </div>
+    </div>
     <nav class="tabs" id="tabs" role="tablist" aria-label="Settings sections">
-      <button role="tab" type="button" data-tab="looks" aria-selected="true"><svg class="ic" aria-hidden="true"><use href="#i-looks"/></svg><span>Looks</span></button>
+      <button role="tab" type="button" data-tab="looks" aria-selected="true"><svg class="ic" aria-hidden="true"><use href="#i-looks"/></svg><span id="tabLooksName">Looks</span></button>
       <button role="tab" type="button" data-tab="tool" aria-selected="false"><svg class="ic" aria-hidden="true"><use href="#i-pen"/></svg><span>Tool</span></button>
       <button role="tab" type="button" data-tab="paper" aria-selected="false"><svg class="ic" aria-hidden="true"><use href="#i-paper"/></svg><span>Paper</span></button>
-      <button role="tab" type="button" data-tab="line" aria-selected="false"><svg class="ic" aria-hidden="true"><use href="#i-line"/></svg><span>Line</span></button>
+      <button role="tab" type="button" data-tab="line" aria-selected="false" class="artistic-only"><svg class="ic" aria-hidden="true"><use href="#i-line"/></svg><span>Line</span></button>
       <button role="tab" type="button" data-tab="photo" aria-selected="false"><svg class="ic" aria-hidden="true"><use href="#i-sliders"/></svg><span>Photo</span></button>
     </nav>
     <div class="panels" id="panels">
-      <section class="panel" data-panel="looks" role="tabpanel" aria-labelledby="h-looks">
+      <section class="panel real-only" data-panel="looks" role="tabpanel" aria-labelledby="h-style">
+        <header class="panel-head"><h2 id="h-style">Style</h2><span class="head-value" id="styleValue"></span></header>
+        <p class="stat real-info" id="realInfo" aria-live="polite"></p>
+        <div class="styles" id="realStyles" role="radiogroup" aria-label="Style"></div>
+        <div class="field-label">Detail</div>
+        <div class="seg" data-bind="realPreset" role="radiogroup" aria-label="Detail">
+          <button role="radio" type="button" data-v="quick">Quick sketch</button>
+          <button role="radio" type="button" data-v="detailed">Detailed</button>
+          <button role="radio" type="button" data-v="masterpiece">Masterpiece</button>
+        </div>
+      </section>
+
+      <section class="panel artistic-only" data-panel="looks" role="tabpanel" aria-labelledby="h-looks">
         <header class="panel-head"><h2 id="h-looks">Look</h2><span class="head-value" id="lookValue"></span>
           <button class="text-btn" type="button" id="lookRevert" hidden>Revert</button></header>
         <div class="looks" id="looks" role="radiogroup" aria-label="Looks"></div>
@@ -201,7 +234,12 @@
 
       <section class="panel" data-panel="tool" role="tabpanel" aria-labelledby="h-tool">
         <header class="panel-head"><h2 id="h-tool">Tool</h2><span class="head-value" id="toolValue"></span></header>
-        <div class="chips tools" id="tools" role="radiogroup" aria-label="Drawing tool"></div>
+        <div class="chips tools artistic-only" id="tools" role="radiogroup" aria-label="Drawing tool"></div>
+        <div class="chips tools real-tools real-only" id="realTools" role="radiogroup" aria-label="Drawing tool at its real size"></div>
+        <div class="real-only" id="realSizeRow" hidden>
+          <div class="field-label">Line width</div>
+          <div class="seg seg-sm" id="realSizes" role="radiogroup" aria-label="Line width"></div>
+        </div>
         <div class="field-label" id="inkLabel">Ink</div>
         <div class="swatches" id="inks" role="radiogroup" aria-labelledby="inkLabel"></div>
         <div class="hint-card" id="toolHint" hidden></div>
@@ -211,9 +249,23 @@
         <header class="panel-head"><h2 id="h-paper">Paper</h2><span class="head-value" id="paperValue"></span></header>
         <div class="chips papers" id="papers" role="radiogroup" aria-label="Paper"></div>
         <div class="hint-card" id="paperHint" hidden></div>
+        <div class="real-only">
+          <div class="field-label" id="sheetLabel">Sheet size</div>
+          <div class="row-ctl sheet-row">
+            <select id="realSheet" class="select" aria-labelledby="sheetLabel"></select>
+          </div>
+          <p class="helper" id="sheetHelp"></p>
+          <div class="hint-card warn" id="sheetWarn" hidden></div>
+          <div class="field-label">Light</div>
+          <div class="seg seg-sm" data-bind="realLight" role="radiogroup" aria-label="Light">
+            <button role="radio" type="button" data-v="window" title="Soft daylight from the upper left">Window</button>
+            <button role="radio" type="button" data-v="raking" title="Low light across the sheet: paper tooth and grooves show">Raking</button>
+            <button role="radio" type="button" data-v="overhead" title="Flat light from above, like a scanner">Overhead</button>
+          </div>
+        </div>
       </section>
 
-      <section class="panel" data-panel="line" role="tabpanel" aria-labelledby="h-line">
+      <section class="panel artistic-only" data-panel="line" role="tabpanel" aria-labelledby="h-line">
         <header class="panel-head"><h2 id="h-line">Line</h2>
           <button class="text-btn" type="button" id="lineReset" hidden>Reset</button></header>
         <div class="field-label field-first">Path</div>
@@ -316,14 +368,15 @@
     </div>
     <div class="dl-svg" hidden>
       <div class="field-label">Kind</div>
-      <div class="seg" data-dl="svgMode" role="radiogroup" aria-label="SVG kind">
+      <div class="seg artistic-only" data-dl="svgMode" role="radiogroup" aria-label="SVG kind">
         <button role="radio" type="button" data-v="stroke">Single stroke</button>
         <button role="radio" type="button" data-v="outline">Filled outline</button>
         <button role="radio" type="button" data-v="plotter">Plotter fill</button>
       </div>
-      <p class="helper" id="dlSvgNote"></p>
+      <p class="helper artistic-only" id="dlSvgNote"></p>
       <label class="switch-row"><span>Include paper colour</span><input type="checkbox" class="switch" id="dlSvgPaper"></label>
     </div>
+    <p class="helper real-note" id="dlRealNote" hidden></p>
     <p class="stat" id="dlStat"></p>
     <footer class="dlg-foot">
       <button class="btn ghost" type="button" id="dlCopy"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg>Copy image</button>
@@ -361,6 +414,7 @@
           <button role="radio" type="button" data-v="30">30 s</button>
           <button role="radio" type="button" data-v="60">60 s</button>
         </div>
+        <p class="stat film-hand" id="filmHand" aria-live="polite" hidden></p>
         <div class="film-pair">
           <div>
             <div class="field-label" id="filmStyleLabel">Style</div>
@@ -382,12 +436,13 @@
         <p class="film-desk-cap" id="filmDeskCap" aria-live="polite"></p>
         <label class="switch-row"><span>Show the drawing tool</span><input type="checkbox" class="switch" data-film="showTool"></label>
         <label class="switch-row"><span>Tape the photo on the desk</span><input type="checkbox" class="switch" data-film="polaroid"></label>
-        <label class="switch-row"><span>Reveal the photo at the end</span><input type="checkbox" class="switch" data-film="reveal"></label>
+        <label class="switch-row" id="filmRevealRow"><span>Reveal the photo at the end</span><input type="checkbox" class="switch" data-film="reveal"></label>
+        <label class="switch-row" id="filmCounterRow" hidden><span>Show the drawing clock</span><input type="checkbox" class="switch" data-film="counter"></label>
         <label class="field-label" for="filmSign">Sign it</label>
         <input class="film-sign" id="filmSign" type="text" maxlength="32" placeholder="Your name or @handle"
           autocomplete="off" autocapitalize="words" spellcheck="false" enterkeyhint="done" aria-describedby="filmSignHelp">
         <p class="helper" id="filmSignHelp">Optional. At the end the pen signs it in the corner.</p>
-        <details class="more">
+        <details class="more" id="filmMore">
           <summary>More</summary>
           <div class="field-label">Pace</div>
           <div class="seg seg-sm" data-film="pacing" role="radiogroup" aria-label="Pace">
@@ -450,9 +505,12 @@
       <dt><kbd>Home</kbd> <kbd>End</kbd></dt><dd>Blank sheet / finished drawing</dd>
       <dt><kbd>\</kbd></dt><dd>Hold to compare with the photo</dd>
       <dt><kbd>F</kbd></dt><dd>Adjust framing</dd>
+      <dt><kbd>M</kbd></dt><dd>Switch Artistic / Realistic</dd>
+      <dt><kbd>+</kbd> <kbd>−</kbd> <kbd>0</kbd></dt><dd>Loupe: zoom in / out / whole sheet (or scroll, pinch, double-click)</dd>
       <dt><kbd>R</kbd></dt><dd>Film a timelapse</dd>
       <dt><kbd>1</kbd>–<kbd>9</kbd></dt><dd>Apply a look</dd>
       <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Fewer / more rings</dd>
+      <dt><kbd>1</kbd>–<kbd>4</kbd> <kbd>[</kbd> <kbd>]</kbd></dt><dd>Realistic: style A–D / less or more detail</dd>
       <dt><kbd>Ctrl</kbd> <kbd>O</kbd></dt><dd>Open a photo</dd>
       <dt><kbd>Ctrl</kbd> <kbd>V</kbd></dt><dd>Paste an image</dd>
       <dt><kbd>Ctrl</kbd> <kbd>Z</kbd></dt><dd>Undo (Shift: redo)</dd>

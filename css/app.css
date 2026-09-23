@@ -190,6 +190,9 @@ kbd { font: 11px var(--mono); padding: 1px 5px; border-radius: 4px; border: 1px 
 .sheet.framing { cursor: grab; }
 .sheet.framing.dragging { cursor: grabbing; }
 .busy { position: absolute; right: 10px; top: 10px; }
+/* the new tool's shaders are still compiling (the sheet keeps its last image): the spinner shows
+   only if that takes a moment */
+.sheet.compiling .busy[hidden] { display: block; animation: fade .2s .35s both; }
 .spinner {
   display: block; width: 16px; height: 16px; border-radius: 50%;
   border: 2px solid rgba(0, 0, 0, .15); border-top-color: var(--accent); animation: spin .8s linear infinite;
@@ -545,3 +548,61 @@ details.more[open] summary::before { transform: rotate(45deg); }
 /* The film body scrolls inside a height-capped dialog, and the preview clips (overflow: hidden),
    so an auto row would only get the preview's min-height and the setup would overlap it. */
 .film-body { grid-auto-rows: max-content; }
+
+/* ───────── film dialog: background (desk) picker ───────── */
+.film-desks { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.film-desks > button {
+  position: relative; display: block; padding: 0; border: 0; border-radius: 8px; background: var(--surface-2);
+  aspect-ratio: 3 / 2; overflow: visible; cursor: pointer;
+}
+.film-desks img {
+  display: block; width: 100%; height: 100%; object-fit: cover; border-radius: 8px;
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+.film-desks > button::after {
+  content: ""; position: absolute; inset: -3px; border-radius: 10px; border: 2px solid transparent; pointer-events: none;
+  transition: border-color .12s var(--ease);
+}
+.film-desks > button:hover::after { border-color: var(--border-strong, var(--border)); }
+.film-desks > button[aria-checked="true"]::after { border-color: var(--accent); }
+.film-desks > button:focus-visible { outline-offset: 4px; }
+.film-desk-cap { margin: 8px 0 0; font-size: 12px; color: var(--text-muted); min-height: 1.4em; }
+.film-desk-cap b { color: var(--text); font-weight: 500; }
+/* the setup column may not grow to its widest content (the swatch row scrolls instead) */
+.film-setup { min-width: 0; }
+@media (max-width: 767px) {
+  .film-body { grid-template-columns: minmax(0, 1fr); }
+  /* phones: one scrollable row of swatches */
+  .film-desks {
+    grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: 64px; overflow-x: auto;
+    padding: 4px 4px 6px; margin: -4px -4px 0; scroll-snap-type: x proximity; scrollbar-width: none;
+  }
+  .film-desks::-webkit-scrollbar { display: none; }
+  .film-desks > button { width: 64px; height: 43px; scroll-snap-align: start; }
+}
+
+/* ───────── film dialog: signature, Post on X ───────── */
+/* the name shows in the handwriting face the pen will sign it in; the placeholder stays in the UI face */
+.film-sign {
+  display: block; width: 100%; height: 42px; padding: 0 12px; margin: 0; border-radius: 10px;
+  border: 1px solid var(--border-strong); background: var(--surface); color: var(--text);
+  font: 700 23px/1 'Caveat', 'Segoe Script', 'Bradley Hand', cursive; letter-spacing: .01em;
+  transition: border-color .12s var(--ease), box-shadow .12s var(--ease);
+}
+.film-sign::placeholder { font: 400 13.5px/1 var(--sans); letter-spacing: 0; color: var(--text-muted); opacity: 1; }
+.film-sign:hover { border-color: var(--text-muted); }
+.film-sign:focus { outline: none; border-color: var(--focus); box-shadow: 0 0 0 3px var(--accent-soft); }
+#filmXNote { margin-top: 8px; }
+@media (max-width: 767px) {
+  .film-sign { height: 44px; }
+  /* four result buttons: the icon carries "Post on X" on a phone */
+  #filmFootResult .btn { padding-left: 12px; padding-right: 12px; }
+}
+/* phones: X, and Download where Share or save… is the main action, keep their icon and name
+   (the text stays for screen readers); the row may wrap on the narrowest screens */
+@media (max-width: 480px) {
+  #filmShareX, #filmDownload.secondary { font-size: 0; gap: 0; width: 44px; padding: 0; justify-content: center; flex: none; }
+  #filmShareX .ic, #filmDownload.secondary .ic { margin: 0; }
+  #filmFootResult { flex-wrap: wrap; row-gap: 8px; }
+  #filmShare { margin-left: auto; }        /* (a wrapped main action still sits at the right) */
+}

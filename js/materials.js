@@ -54,7 +54,7 @@ export const LOOKS = [
   { id: 'sumi', name: 'Ink brush', brush: 'brush', ink: '#0e0e0e', paper: 'coldpress',
     line: { technique: 'thickness', rings: 50, weight: 0.95, hairline: 0.06, wobble: 0.3 } },
   { id: 'biro', name: 'Blue biro', brush: 'ballpoint', ink: '#1d3a8a', paper: 'cream',
-    line: { technique: 'wave', rings: 60, penWidth: 0.16, amplitude: 0.9, frequency: 1.6, wobble: 0.2 } },
+    line: { technique: 'wave', rings: 60, penWidth: 0.22, amplitude: 0.9, frequency: 1.6, wobble: 0.2 } },
   { id: 'chalk', name: 'Chalkboard', brush: 'chalk', ink: '#f3f0e8', paper: 'chalkboard',
     line: { technique: 'thickness', rings: 52, weight: 0.9, hairline: 0.1, wobble: 0.3 } },
   { id: 'gold', name: 'Gold on black', brush: 'gold', ink: '#d9b44a', paper: 'black',

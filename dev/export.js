@@ -4,9 +4,11 @@
 //   ?t=strips    forced strips (render height 256) vs one full pass, every brush, 2048; seam rates
 //   ?t=seams     production strip plan vs a full pass at 4096; two strip plans against each other at 8192
 //   ?t=shift     least-squares sub-pixel shift of strips vs full pass + x40 difference maps
+//   ?t=fragcoord hand-made strips vs one pass (brushes=, layer=pig, margin=, strip=): lists differing px
 //   ?t=big       2048/4096/8192 (?sizes=) exports: timing, in-flight memory; files -> shots/export_*.png
 //   ?t=jank      longest main-thread stall during an export (?size=, ?warm=0 for a cold page)
 //   ?t=alpha     transparent exports: exact decode, straight-alpha fringe check; files -> shots/
+//   ?t=transp    transparent export over the paper's colour vs the paper export (wet media too)
 //   ?t=svg       SVG outline/stroke/plotter rasterised by the browser vs the WebGL line (+ zig-zag stress,
 //                hard tone edges, maze); ?cases=hard_outline,maze_plotter picks some
 //   ?t=abort     cancel mid-export, pre-aborted signal, 20 exports in a row (context leaks warn)
@@ -16,7 +18,6 @@
 //   ?t=quick     small cross-browser subset (--browser firefox | webkit)
 // Sets window.__done = { ok, report }.
 import { Renderer } from '../js/renderer.js';
-import { VERT_STROKE, FRAG_STROKE } from '../js/shaders.js';
 import { rasterize, processTone, buildField, TONE_DEFAULTS, CROP_DEFAULTS } from '../js/tone.js';
 import { buildSpiral, LINE_DEFAULTS, STRIDE } from '../js/spiral.js';
 import { buildMaze, MAZE_DEFAULTS } from '../js/maze.js';
@@ -245,11 +246,10 @@ T.strips = async () => {
   }
   const worst = Math.max(...rows.map(r => r.strips.max));
   const singleWorst = Math.max(...rows.filter(r => r.single).map(r => r.single.max));
-  // Single pass must be byte-identical. Strips may differ only by isolated float flips of the
-  // stroke shader's interpolated position (see ?t=fragcoord): no broad noise, at most 0.005% of
-  // pixels over 8 levels, and no excess at seams.
-  const ok = singleWorst === 0 && rows.every(r => r.strips.mean < 0.01 && r.strips.over8 <= 5e-5 * S * S &&
-    (r.strips.seamDiffPerRow ?? 0) <= 2 * (r.strips.otherDiffPerRow ?? 0) + 2);
+  // Single pass and strips must both be byte-identical to the reference: every pass takes the
+  // paper position from gl_FragCoord and every filtered tap is an exact texel bilinear, so a strip
+  // computes what the full sheet does, bit for bit (see ?t=fragcoord, which lists any difference).
+  const ok = singleWorst === 0 && worst === 0;
   return { ok, size: S, strip, singleWorst, stripWorst: worst, rows };
 };
 
@@ -285,7 +285,7 @@ T.seams = async () => {
       log(JSON.stringify(out[out.length - 1]));
     }
   }
-  return { ok: out.every(r => r.mean < 0.01 && r.over8 <= 5e-5 * r.S * r.S && r.seamDiffPerRow <= 2 * r.otherDiffPerRow + 2), out };
+  return { ok: out.every(r => r.max === 0), out };            // strips are exact (see T.strips)
 };
 
 T.big = async () => {
@@ -363,6 +363,58 @@ T.alpha = async () => {
   // Media whose colour is exactly the ink (no glow / metallic sheen) must have zero fringe error.
   const flat = out.filter(r => ['fineliner', 'crayon', 'charcoal', 'chalk'].includes(r.brush));
   return { ok: out.every(r => r.ct === 6 && r.premulMean < 0.01 && r.premulOver8 <= 5e-5 * S * S) && flat.every(r => r.maxPremulOffInk <= 1.5 && Math.abs(r.edgeLumWeighted - r.inkLum) < 1), size: S, out };
+};
+
+// Transparent PNG vs the paper export: the transparent ink laid over the paper's own flat colour
+// must read like the drawing on paper (8x8 block mean luminance, 0..255). Wet media carry part of
+// their ink in the simulation; this catches a transparent path that leaves it out. (On a near-white
+// sheet by default: over a tinted one a translucent coloured dye cannot be straight alpha exactly,
+// a multiply darkens the paper's tint under it too, by (1 - paper) x ink; so each medium's darkest
+// ink by default, ?ink= and ?paper= to see how far that goes.) Media with a lit material (graphite,
+// wax, oil, metal) are reported but not judged: the paper render adds their sheen, which an ink-only
+// file has no light for.
+//   ?t=transp  (brushes=, size=, paper=, ink=)
+T.transp = async () => {
+  const S = +(q.get('size') || 2048);
+  const ids = (q.get('brushes') || 'fineliner,fountain,brush,marker,watercolour,pencil,charcoal').split(',');
+  const out = [];
+  const lum = h => { const [r, g, b] = hexToRgb(h); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+  for (const id of ids) {
+    const b = brushById(id);
+    const ink = q.get('ink') || (b.prefersDark ? undefined : [...b.inks].sort((x, y) => lum(x[0]) - lum(y[0]))[0][0]);
+    const st = makeState({ brush: id, paper: q.get('paper') || (b.prefersDark ? paperFor(b) : 'sketch'), ink });
+    const pc = hexToRgb(st.paper.color).map(v => v * 255);
+    const B = 8, nb = S / B;
+    const lumOf = async (blob, over) => {
+      const acc = new Float64Array(nb * nb);
+      await decodeRows(blob, (y, row, C) => {
+        for (let x = 0; x < S; x++) {
+          const o = x * C;
+          let r = row[o], g = row[o + 1], bb = row[o + 2];
+          if (over && C === 4) {
+            const a = row[o + 3] / 255;
+            r = r * a + pc[0] * (1 - a); g = g * a + pc[1] * (1 - a); bb = bb * a + pc[2] * (1 - a);
+          }
+          acc[(y / B | 0) * nb + (x / B | 0)] += 0.2126 * r + 0.7152 * g + 0.0722 * bb;
+        }
+      });
+      return acc.map(v => v / (B * B));
+    };
+    const lp = await lumOf(await exportPNG(st, { size: S }), false);
+    const lt = await lumOf(await exportPNG(st, { size: S, transparent: true }), true);
+    // only blocks with ink in them (the bare sheet differs by its texture alone)
+    let sum = 0, n = 0, sp = 0, stt = 0;
+    const bare = 0.2126 * pc[0] + 0.7152 * pc[1] + 0.0722 * pc[2];
+    for (let i = 0; i < lp.length; i++) {
+      if (lt[i] > bare - 4) continue;
+      sum += Math.abs(lp[i] - lt[i]); sp += lp[i]; stt += lt[i]; n++;
+    }
+    const row = { brush: id, paper: st.paper.id, ink: st.ink, judged: ['ink', 'chalk'].includes(b.material), inkBlocks: n,
+      meanBlockDL: +(sum / Math.max(1, n)).toFixed(2), meanLumPaper: +(sp / Math.max(1, n)).toFixed(1), meanLumTransp: +(stt / Math.max(1, n)).toFixed(1) };
+    out.push(row);
+    log(JSON.stringify(row));
+  }
+  return { ok: out.every(r => !r.judged || r.meanBlockDL < 3), size: S, out };
 };
 
 /** Rasterise an SVG with the browser at S x S on white; returns the RGBA bytes + canvas. */
@@ -593,25 +645,16 @@ T.shift = async () => {
 T.none = async () => ({ ok: true });     // fixture page for tests/export.drive.mjs
 
 /**
- * Proposal check for the lead (shaders.js is not ours): FRAG_STROKE reads the paper position
- * from an interpolated varying, whose barycentric rounding depends on the render-target size.
- * Taking it from gl_FragCoord instead (exact at pixel centres with integer origins) should make
- * strips identical to a full pass. Renders strips by hand with both versions and compares.
+ * Strips vs one full pass, rendered by hand (no encoder). The stroke, composite and blur passes
+ * take the paper position from gl_FragCoord (exact at pixel centres with whole origins), so every
+ * medium but the glow's bilinear blur taps should match to the bit. Lists the differing pixels.
  */
-class FragCoordRenderer extends Renderer {
-  _init() {
-    super._init();
-    const fs = FRAG_STROKE.replace('in vec2 vPos;', 'uniform vec2 uOrigin;\nuniform vec2 uRes;')
-      .replace(/void main\(\) \{(?![\s\S]*void main\(\) \{)/,
-        'void main() {\n  vec2 vPos = uOrigin + vec2(gl_FragCoord.x, uRes.y - gl_FragCoord.y);');
-    this.progs.stroke = this._program(VERT_STROKE, fs);
-  }
-}
-
+const LAYER = q.get('layer') || 'canvas';        // 'pig': compare the pigment target instead
 function renderFull(Cls, st, S) {
   const r = new Cls(document.createElement('canvas'));
   r.setSize(S, S); r.setLayout(st.layout); r.setPaper(st.paper, 1); r.setStyle(st); r.setGeometry(st.geom); r.render(Infinity);
   const px = new Uint8Array(S * S * 4);
+  r.gl.bindFramebuffer(r.gl.FRAMEBUFFER, LAYER === 'pig' ? r.pig.fbo : null);
   r.gl.readPixels(0, 0, S, S, r.gl.RGBA, r.gl.UNSIGNED_BYTE, px);
   r.destroy();
   return px;                                    // bottom-up
@@ -624,6 +667,7 @@ function renderStrips(Cls, st, S, H, margin) {
   for (let y0 = 0; y0 < S; y0 += core) {
     const rows = Math.min(core, S - y0);
     r.setOrigin(0, y0 - margin); r.render(Infinity);
+    r.gl.bindFramebuffer(r.gl.FRAMEBUFFER, LAYER === 'pig' ? r.pig.fbo : null);
     r.gl.readPixels(0, H - margin - rows, S, rows, r.gl.RGBA, r.gl.UNSIGNED_BYTE, buf);
     // strip rows (bottom-up) -> full bottom-up image: paper row y0 + k sits at full row S - 1 - (y0 + k)
     for (let k = 0; k < rows; k++) {
@@ -636,26 +680,30 @@ function renderStrips(Cls, st, S, H, margin) {
 }
 
 T.fragcoord = async () => {
-  const S = 2048, H = 256, margin = 48;
+  const S = +(q.get('size') || 2048), H = +(q.get('strip') || 256), margin = +(q.get('margin') || 48);
+  const opts = q.get('brushes') ? q.get('brushes').split(',').map(b => ({ brush: b, paper: paperFor(brushById(b)) }))
+    : [{ brush: 'chalk', paper: 'chalkboard' }, { brush: 'charcoal', paper: 'coldpress' }, { brush: 'crayon', paper: 'kraft' }, { brush: 'pencil', paper: 'sketch' }];
   const out = [];
-  for (const opt of [{ brush: 'chalk', paper: 'chalkboard' }, { brush: 'charcoal', paper: 'coldpress' }, { brush: 'crayon', paper: 'kraft' }, { brush: 'pencil', paper: 'sketch' }]) {
+  for (const opt of opts) {
     const st = makeState(opt);
-    const row = { brush: opt.brush };
-    for (const [name, Cls] of [['varying (current)', Renderer], ['gl_FragCoord', FragCoordRenderer]]) {
-      const a = renderFull(Cls, st, S), b = renderStrips(Cls, st, S, H, margin);
-      let max = 0, n = 0, big = 0;
-      for (let i = 0; i < a.length; i++) { const d = Math.abs(a[i] - b[i]); if (d) { n++; if (d > max) max = d; if (d > 8) big++; } }
-      row[name] = { max, valuesDiffering: n, over8: big };
+    const a = renderFull(Renderer, st, S), b = renderStrips(Renderer, st, S, H, margin);
+    let max = 0, n = 0, big = 0;
+    const where = [];
+    for (let i = 0; i < a.length; i++) {
+      const d = Math.abs(a[i] - b[i]);
+      if (!d) continue;
+      n++; if (d > max) max = d; if (d > 8) big++;
+      if (where.length < 12 && (i & 3) === 0) {
+        const px = i >> 2, x = px % S, y = S - 1 - Math.floor(px / S);     // paper px (y down)
+        const core = H - 2 * margin;
+        where.push({ x, y, rowInStrip: y % core, full: [...a.subarray(i, i + 4)], strip: [...b.subarray(i, i + 4)] });
+      }
     }
-    // the patched shader must not change the picture itself
-    const cur = renderFull(Renderer, st, S), pat = renderFull(FragCoordRenderer, st, S);
-    let dmax = 0, dn = 0;
-    for (let i = 0; i < cur.length; i++) { const d = Math.abs(cur[i] - pat[i]); if (d) { dn++; if (d > dmax) dmax = d; } }
-    row.patchedVsCurrentFullPass = { max: dmax, valuesDiffering: dn };
+    const row = { brush: opt.brush, max, valuesDiffering: n, over8: big, where };
     out.push(row);
     log(JSON.stringify(row));
   }
-  return { ok: out.every(r => r['gl_FragCoord'].max <= 2), S, H, margin, out };
+  return { ok: out.every(r => r.max <= 2), S, H, margin, out };
 };
 
 T.fallback = async () => {

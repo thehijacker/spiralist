@@ -19,22 +19,44 @@ export const SHEET_MM = 200;
 // 0.4 up also long strands and bundles), specks = speck density (from 0.5 up also sparse ~0.5 mm
 // bark specks). Surface knobs (composite): relief = light on the tooth, mottle = cloudy
 // formation, smudge = chalkboard eraser haze + swirls, grid = blueprint grid.
+// Physical knobs (wet media, js/wetsim.js), all 0..1:
+//   absorb    how fast the sheet drinks standing liquid (blotting paper 1, a painted board ~0)
+//   sizing    how much the sheet resists wetting: a sized sheet pins the wet edge (hard edges,
+//             coffee-ring rims, pooling); an unsized one lets liquid creep out (soft bleed)
+//   fibre     how strongly liquid wicks along the fibres (feathering) rather than evenly
+//   capacity  how much liquid the sheet holds before it is saturated (thick cotton rag holds a lot)
+//   grainDeg  machine direction of the fibres, degrees (0 = across the sheet)
 export const PAPERS = [
   { id: 'sketch', name: 'Sketchbook', color: '#f4f4f0', speck: '#8c887e', tooth: 0.9, toothCells: 120,
-    bumps: 0.4, bumpCells: 44, fibers: 0.35, specks: 0.12, relief: 0.35, mottle: 0.035, smudge: 0, grid: 0 },
+    bumps: 0.4, bumpCells: 44, fibers: 0.35, specks: 0.12, relief: 0.35, mottle: 0.035, smudge: 0, grid: 0,
+    absorb: 0.45, sizing: 0.45, fibre: 0.45, capacity: 0.45, grainDeg: 0 },
   { id: 'cream', name: 'Cream', color: '#f1e6cd', speck: '#9a8260', tooth: 0.93, toothCells: 104,
-    bumps: 0.55, bumpCells: 36, fibers: 0.5, specks: 0.3, relief: 0.42, mottle: 0.05, smudge: 0, grid: 0 },
+    bumps: 0.55, bumpCells: 36, fibers: 0.5, specks: 0.3, relief: 0.42, mottle: 0.05, smudge: 0, grid: 0,
+    absorb: 0.3, sizing: 0.7, fibre: 0.35, capacity: 0.4, grainDeg: 90 },
   { id: 'coldpress', name: 'Watercolour', color: '#f2ebdf', speck: '#958e80', tooth: 0.5, toothCells: 110,
-    bumps: 1.4, bumpCells: 22, fibers: 0.25, specks: 0.08, relief: 0.75, mottle: 0.045, smudge: 0, grid: 0 },
+    bumps: 1.4, bumpCells: 22, fibers: 0.25, specks: 0.08, relief: 0.75, mottle: 0.045, smudge: 0, grid: 0,
+    absorb: 0.4, sizing: 0.65, fibre: 0.15, capacity: 1.0, grainDeg: 0 },
   { id: 'kraft', name: 'Kraft', color: '#bf9366', speck: '#4f3622', tooth: 1.04, toothCells: 120,
-    bumps: 0.3, bumpCells: 30, fibers: 1.0, specks: 1.0, relief: 0.3, mottle: 0.09, smudge: 0, grid: 0 },
+    bumps: 0.3, bumpCells: 30, fibers: 1.0, specks: 1.0, relief: 0.3, mottle: 0.09, smudge: 0, grid: 0,
+    absorb: 0.55, sizing: 0.35, fibre: 0.8, capacity: 0.55, grainDeg: 0 },
   { id: 'black', name: 'Black card', color: '#1c1c1f', speck: '#45454b', tooth: 0.89, toothCells: 150,
-    bumps: 0, bumpCells: 1, fibers: 0.2, specks: 0.15, relief: 0.25, mottle: 0.03, smudge: 0, grid: 0, dark: true },
+    bumps: 0, bumpCells: 1, fibers: 0.2, specks: 0.15, relief: 0.25, mottle: 0.03, smudge: 0, grid: 0, dark: true,
+    absorb: 0.35, sizing: 0.55, fibre: 0.3, capacity: 0.5, grainDeg: 0 },
   { id: 'chalkboard', name: 'Chalkboard', color: '#2d3c34', speck: '#6f7d74', tooth: 0.97, toothCells: 112,
-    bumps: 0, bumpCells: 1, fibers: 0, specks: 0.35, relief: 0.3, mottle: 0.09, smudge: 1.0, grid: 0, dark: true },
+    bumps: 0, bumpCells: 1, fibers: 0, specks: 0.35, relief: 0.3, mottle: 0.09, smudge: 1.0, grid: 0, dark: true,
+    absorb: 0.04, sizing: 0.95, fibre: 0, capacity: 0.1, grainDeg: 0 },
   { id: 'blueprint', name: 'Blueprint', color: '#1b5796', speck: '#5b8ac2', tooth: 0.78, toothCells: 128,
-    bumps: 0.25, bumpCells: 40, fibers: 0.3, specks: 0.15, relief: 0.3, mottle: 0.06, smudge: 0, grid: 1, dark: true },
+    bumps: 0.25, bumpCells: 40, fibers: 0.3, specks: 0.15, relief: 0.3, mottle: 0.06, smudge: 0, grid: 1, dark: true,
+    absorb: 0.15, sizing: 0.8, fibre: 0.25, capacity: 0.3, grainDeg: 90 },
 ];
+
+/** Physical properties with defaults, for papers defined elsewhere (older saved looks, tests). */
+export function paperPhysics(p) {
+  return {
+    absorb: p.absorb ?? 0.4, sizing: p.sizing ?? 0.5, fibre: p.fibre ?? 0.3,
+    capacity: p.capacity ?? 0.5, grainDeg: p.grainDeg ?? 0,
+  };
+}
 
 export const paperById = id => PAPERS.find(p => p.id === id) || PAPERS[0];
 
@@ -208,10 +230,62 @@ vec4 paperTile(vec2 uv) {
 }
 `;
 
+// Fibre orientation of the sheet (radians, sheet axes: x right, y down) at pu paper units: the
+// machine direction plus a floc-scale wander (fibres lie in clumps). Shared by the wet grid's
+// physical map (anisotropic bleed) and the brushes (feathering hairs follow the same fibres).
+// Needs uSeed and vnoise (COMMON).
+export const PAPER_FIBRE_GLSL = /* glsl */`
+float fibreAngle(vec2 pu, vec2 grainDir) {
+  float wander = (vnoise(pu / 14.0 + uSeed * 3.1) - 0.5) * 2.6 + (vnoise(pu / 5.0 + uSeed * 7.7) - 0.5) * 1.2;
+  return atan(grainDir.y, grainDir.x) + wander;
+}
+`;
+
+// Physical map of the sheet for the wet-media simulation (js/wetsim.js), evaluated once per paper
+// on the simulation grid (sheet space, ~1 paper unit per cell). P = position in grid px; the GRAIN
+// uniforms are set for the grid, so grainAt() returns the height averaged over a cell.
+// Returns:
+//   x  height (0..1): liquid settles and pigment granulates in the valleys
+//   y  conductance / 2 (0..1): how easily liquid moves through this spot. Formation flocs (denser
+//      and looser patches, ~1-4 mm) vary it gently; single long fibres are fast capillary channels
+//      that ink creeps along (feathering), so they raise it sharply along a thin line.
+//   zw fibre orientation as a doubled-angle vector (cos 2a, sin 2a) * alignment, stored * 0.5 + 0.5:
+//      a doubled angle is the same for a fibre and the fibre turned round, so it can be averaged.
+// Uniforms: uFibre (0..1, capillary anisotropy), uGrainDir (machine direction, unit vector),
+// uAbsorbP (absorbency), uSeed.
+export const PAPER_PHYS_GLSL = /* glsl */`
+vec4 paperPhys(vec2 P) {
+  vec2 pu = P / uU;                                    // paper units
+  float h = grainAt(P, 0.0).x;
+  float ang = fibreAngle(pu, uGrainDir);
+  float align = 0.55 + 0.45 * vnoise(pu / 9.0 + 19.0 + uSeed);
+  vec2 o = vec2(cos(2.0 * ang), sin(2.0 * ang)) * align;
+  // single long fibres: one per ~6 U cell, 3-9 U long, ~0.5 U wide, laid along the local
+  // orientation; nearest three cells in each direction so fibres cross cell borders
+  float strand = 0.0;
+  vec2 ci = floor(pu / 6.0);
+  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+    vec2 c = ci + vec2(float(x), float(y));
+    float r1 = hash21(c + uSeed * 17.0), r2 = hash21(c + 31.7 + uSeed), r3 = hash21(c + 63.1);
+    vec2 cp = (c + vec2(r1, r2)) * 6.0;
+    float a = ang + (r3 - 0.5) * 1.4;
+    vec2 t = vec2(cos(a), sin(a));
+    vec2 d = pu - cp;
+    float along = dot(d, t), across = dot(d, vec2(-t.y, t.x));
+    float len = 1.5 + 3.0 * hash21(c + 91.3);
+    float s = (1.0 - smoothstep(0.25, 0.6, abs(across))) * (1.0 - smoothstep(len * 0.7, len, abs(along)));
+    strand = max(strand, s * step(0.35, r3));
+  }
+  float floc = 0.8 + 0.4 * vnoise(pu / 11.0 + 7.0 + uSeed * 5.0);
+  float cond = floc * (1.0 + strand * uFibre * (0.5 + uAbsorbP));
+  return vec4(h, clamp(cond * 0.5, 0.0, 1.0), o * 0.5 + 0.5);
+}
+`;
+
 // Paper surface colour at full-paper pixel P (without ink). Also returns the relief `shade`
 // (1.0 on flat paper) which the composite applies to paper and, partly, to ink.
-// Uniforms: uPaperColor, uSpeckColor, uRelief, uMottle, uSmudge, uGrid (uSpeckAmt is unused: the
-// tile's B channel already carries each paper's speck density and strength).
+// Uniforms: uPaperColor, uSpeckColor, uRelief, uMottle, uSmudge, uGrid, uPaperLight (uSpeckAmt is
+// unused: the tile's B channel already carries each paper's speck density and strength).
 export const PAPER_SURFACE_GLSL = /* glsl */`
 // The two decorrelated samplings of grainAt() (shaders.js; keep in sync), all four channels.
 void paperTaps(vec2 P, float lod, out vec4 a, out vec4 b) {
@@ -319,7 +393,10 @@ vec3 paperSurface(vec2 P, out float shade) {
   // (the key light needs nothing else, so a central difference along it costs two taps, not four).
   // Lighting is linear in the slope, so a pixel's shade equals the average of the finer pixels
   // it covers.
-  const vec2 L = vec2(0.55, 0.65);                     // key light, from the upper left
+  // Key light: uPaperLight points AWAY from the light across the sheet, and its length is the
+  // relief gain (lower light, longer shadows). The renderer's default is vec2(0.55, 0.65): soft
+  // window light from the upper left (renderer.setLight changes it).
+  vec2 L = uPaperLight;
   float e = max(1.0, exp2(-uTileLod));
   vec2 dl = normalize(L) * e;
   float slope = (paperTap(P + dl, lod, m).r - paperTap(P - dl, lod, m).r) / (2.0 * e * exp2(uTileLod));

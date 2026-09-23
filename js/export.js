@@ -922,7 +922,11 @@ function outlineD(m) {
     const h = hIn[r], dIn = h - hOut[r - 1], dOut = h - hIn[r + 1];
     const pin = Math.max(0, Math.atan2(dIn, SL[r - 1])), pout = Math.max(0, Math.atan2(dOut, SL[r]));
     PIN[r] = pin; POUT[r] = pout;
-    GENTLE[r] = h * th * th / 8 <= JOIN_TOL && h * (1 - Math.cos(pin)) <= JOIN_TOL && h * (1 - Math.cos(pout)) <= JOIN_TOL ? 1 : 0;
+    // A bisector point sits h|th|/2 along the disc from each edge's true end; on a steep edge
+    // (either way) that tilts the edge by as much times the sine of its slope.
+    const steep = Math.max(Math.abs(dIn) / Math.hypot(SL[r - 1], dIn), Math.abs(dOut) / Math.hypot(SL[r], dOut));
+    GENTLE[r] = h * th * th / 8 <= JOIN_TOL && h * Math.abs(th) / 2 * steep <= JOIN_TOL &&
+      h * (1 - Math.cos(pin)) <= JOIN_TOL && h * (1 - Math.cos(pout)) <= JOIN_TOL ? 1 : 0;
     if (GENTLE[r]) continue;
     SWI[r] = pin > 0 && 2 * h * Math.sin(pin) >= Math.hypot(SL[r - 1], dIn) - 1e-9 ? 1 : 0;
     SWO[r] = pout > 0 && 2 * h * Math.sin(pout) >= Math.hypot(SL[r], dOut) - 1e-9 ? 1 : 0;
@@ -932,7 +936,7 @@ function outlineD(m) {
     const put = (x, y) => { xs.push(x); ys.push(y); };
     // Angles on vertex r's discs in "forward" units for this side: 0 = s * (n0 = normal of the
     // incoming segment), positive = the way the pen travels (a rotation by -s).
-    let px = 0, py = 0, ax = 0, ay = 0;
+    let px = 0, py = 0, ax = 0, ay = 0, cur = 0;       // the current vertex, its pivot and n0
     const at = (a, h) => {
       const c = Math.cos(a), sn = Math.sin(a);
       put(px + h * (s * ax * c + ay * sn), py + h * (s * ay * c - ax * sn));
@@ -961,7 +965,6 @@ function outlineD(m) {
       // cos a = s (z . n0) / h, sin a = (z . t0) / h with t0 = (ay, -ax)
       return Math.atan2(zx * ay - zy * ax, s * (zx * ax + zy * ay));
     };
-    let cur = 0;
     for (let r = 0; r < V; r++) {
       px = PX[r]; py = PY[r]; cur = r;
       if (r === 0 || r === V - 1) {
@@ -1153,8 +1156,8 @@ export function buildSVG(geom, { mode, ink = '#17171a', paper = null, sizeMm = S
     out.push(`<g inkscape:groupmode="layer" inkscape:label="Paper" id="paper" sodipodi:insensitive="true">\n`,
       `<rect x="0" y="0" width="${mm(S)}" height="${mm(S)}" fill="${paperHex}"/>\n</g>\n`);
   }
-  const layer = kind === 'spiral' ? 'Spiral' : kind === 'maze' ? 'Maze' : 'Line';
-  out.push(`<g inkscape:groupmode="layer" inkscape:label="${layer}" id="${layer.toLowerCase()}">\n`,
+  const [layer, layerId] = kind === 'spiral' ? ['Spiral', 'spiral'] : kind === 'maze' ? ['Maze', 'maze'] : ['Line', 'drawing'];
+  out.push(`<g inkscape:groupmode="layer" inkscape:label="${layer}" id="${layerId}">\n`,
     `<path id="line" ${attrs} d="`, d.toString(), `"/>\n</g>\n</svg>\n`);
   return out.join('');
 }

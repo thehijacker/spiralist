@@ -2,13 +2,17 @@
 // needed one). Network-first for everything this site serves, so an update is picked up on the
 // next load and modules from two different releases are never mixed; the cache is the fallback.
 // Google Fonts are cached on first use.
-const CACHE = 'spiralist-2026-09-23';
+const CACHE = 'spiralist-2026-09-23b';
+// every module the app imports (statically or on demand) and the film's desk photos, so the whole
+// app, filming included, works offline after the first visit
+const DESK_IDS = ['nero', 'calacatta', 'travertine', 'limewash', 'velvet', 'leather', 'sunlit', 'onyx'];
 const SHELL = [
   './', './index.html', './css/app.css', './manifest.webmanifest', './icon.svg', './vendor/mp4-muxer.mjs',
-  './js/app.js', './js/brushes.js', './js/download.js', './js/encoder.js', './js/export.js', './js/film.js',
+  './js/app.js', './js/brushes.js', './js/desks.js', './js/download.js', './js/encoder.js', './js/export.js', './js/film.js',
   './js/freeline.js', './js/history.js', './js/imageio.js', './js/materials.js', './js/maze.js', './js/papers.js',
-  './js/renderer.js', './js/samples.js', './js/scene.js', './js/share.js', './js/shaders.js', './js/spiral.js', './js/store.js',
-  './js/thumbs.js', './js/tone.js', './js/tools.js', './js/ui.js',
+  './js/renderer.js', './js/samples.js', './js/scene.js', './js/share.js', './js/shaders.js', './js/signature.js',
+  './js/spiral.js', './js/store.js', './js/thumbs.js', './js/tone.js', './js/tools.js', './js/ui.js', './js/wetsim.js',
+  ...DESK_IDS.map(id => `./img/desks/${id}.jpg`),
 ];
 
 self.addEventListener('install', e => {

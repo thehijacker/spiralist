@@ -10,7 +10,7 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23f3ead6'/%3E%3Cpath d='M32 32c0-2 2-3 3.5-2S38 34 35 36s-8.5-.5-8.5-5 5-9 10-8 9.5 6 8 12-9 11.5-16 10-12.5-9-11.5-17 8.5-15 17-15 15.5 7 16 15' fill='none' stroke='%23c43d16' stroke-width='3.4' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Caveat:wght@700&family=Geist:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="icon.svg">
 <link rel="stylesheet" href="css/app.css">
@@ -377,9 +377,16 @@
             </div>
           </div>
         </div>
+        <div class="field-label" id="filmDeskLabel">Background</div>
+        <div class="film-desks" data-film="desk" role="radiogroup" aria-labelledby="filmDeskLabel" aria-describedby="filmDeskCap"></div>
+        <p class="film-desk-cap" id="filmDeskCap" aria-live="polite"></p>
         <label class="switch-row"><span>Show the drawing tool</span><input type="checkbox" class="switch" data-film="showTool"></label>
         <label class="switch-row"><span>Tape the photo on the desk</span><input type="checkbox" class="switch" data-film="polaroid"></label>
         <label class="switch-row"><span>Reveal the photo at the end</span><input type="checkbox" class="switch" data-film="reveal"></label>
+        <label class="field-label" for="filmSign">Sign it</label>
+        <input class="film-sign" id="filmSign" type="text" maxlength="32" placeholder="Your name or @handle"
+          autocomplete="off" autocapitalize="words" spellcheck="false" enterkeyhint="done" aria-describedby="filmSignHelp">
+        <p class="helper" id="filmSignHelp">Optional. At the end the pen signs it in the corner.</p>
         <details class="more">
           <summary>More</summary>
           <div class="field-label">Pace</div>
@@ -408,6 +415,7 @@
         <p class="result-title">Your timelapse is ready</p>
         <p class="stat" id="filmMeta"></p>
         <p class="helper" id="filmNote" hidden></p>
+        <p class="helper" id="filmXNote" role="status" hidden>The video is in your downloads. Attach it to the post that opened on X.</p>
       </div>
     </div>
 
@@ -424,6 +432,7 @@
     <footer class="dlg-foot" id="filmFootResult" hidden>
       <button class="btn ghost" type="button" id="filmAgain">Film again</button>
       <span class="spacer"></span>
+      <button class="btn ghost" type="button" id="filmShareX" title="Save the video and open a post on X"><svg class="ic" aria-hidden="true"><use href="#i-x"/></svg>Post on X</button>
       <button class="btn secondary" type="button" id="filmDownload"><svg class="ic" aria-hidden="true"><use href="#i-download"/></svg>Download</button>
       <button class="btn primary" type="button" id="filmShare" hidden><svg class="ic" aria-hidden="true"><use href="#i-share"/></svg>Share or save…</button>
     </footer>

@@ -11,6 +11,10 @@
 //              players, so it is patched in afterwards.
 //
 // Every failure is an Error with .code: 'unsupported' | 'aborted' | 'encode'.
+// Extra option: keyFrames (frame indices that must start a clean picture, e.g. where the film's
+// camera comes to rest); the recorder cannot force keyframes and ignores it.
+// onProgress(done, total, canvas) counts up; onProgress(0, total, null) means the export started
+// over (hardware encoder failed -> software, or WebCodecs -> real-time recorder).
 
 const KEYFRAME_SECONDS = 2;
 const MAX_QUEUE = 4;                 // frames waiting inside the encoder before we stop feeding it
@@ -18,6 +22,7 @@ const STALL_MS = 20000;              // an encoder that makes no progress this l
 const AVC_PROFILES = ['6400', '4D00', '42E0'];   // High, Main, Constrained Baseline
 const RECORDER_TYPES = ['video/mp4;codecs=avc1.640028', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm'];
 const MIN_PUSH_GAP_MS = 20;          // recorder: at least one 60 Hz capture tick between frames
+const MAX_RECORDER_PX = 3840 * 2160; // recorder: largest frame real-time capture keeps up with
 
 let muxerLib = null;
 const loadMuxer = () => (muxerLib ||= import('../vendor/mp4-muxer.mjs').catch(e => { muxerLib = null; throw e; }));
@@ -113,6 +118,17 @@ async function paint(drawFrame, i, ctx, canvas, signal) {
   }
 }
 
+// So is onProgress, and it gets the same treatment on both paths.
+function progress(onProgress, done, total, canvas) {
+  if (!onProgress) return;
+  try {
+    onProgress(done, total, canvas);
+  } catch (e) {
+    if (coded(e)) throw e;
+    throw fail('encode', `The progress callback failed at frame ${done}: ${msg(e)}`, e);
+  }
+}
+
 // ------------------------------------------------------------------------------ bitrate & level
 const BITRATE_ANCHORS = [[1080 * 1080, 8e6], [1080 * 1350, 9e6], [1080 * 1920, 12e6]];
 
@@ -131,16 +147,19 @@ export function defaultBitrate(width, height, fps = 30) {
   return Math.round(Math.min(50e6, Math.max(1e6, b)) / 1e5) * 1e5;
 }
 
-// Lowest H.264 level (4.0 at least) whose frame-size and macroblock-rate limits fit.
-const AVC_LEVELS = [   // level_idc, MaxFS (macroblocks), MaxMBPS
-  [0x28, 8192, 245760], [0x2A, 8704, 522240], [0x32, 22080, 589824], [0x33, 36864, 983040],
-  [0x34, 36864, 2073600], [0x3C, 139264, 4177920], [0x3D, 139264, 8355840], [0x3E, 139264, 16711680],
+// Lowest H.264 level (4.0 at least) whose frame-size, macroblock-rate and bitrate limits fit
+// (Table A-1; MaxBR as for Main, which High's 1.25x only loosens). 1080 x 1920 is 4.0 at 30 fps
+// and 4.2 at 60 (8160 macroblocks x 60 = 489,600/s, over 4.0/4.1's 245,760).
+const AVC_LEVELS = [   // level_idc, MaxFS (macroblocks), MaxMBPS, MaxBR (kbit/s)
+  [0x28, 8192, 245760, 20000], [0x29, 8192, 245760, 50000], [0x2A, 8704, 522240, 50000],
+  [0x32, 22080, 589824, 135000], [0x33, 36864, 983040, 240000], [0x34, 36864, 2073600, 240000],
+  [0x3C, 139264, 4177920, 240000], [0x3D, 139264, 8355840, 480000], [0x3E, 139264, 16711680, 800000],
 ];
-export function avcLevel(width, height, fps) {
+export function avcLevel(width, height, fps, bitrate = 0) {
   const mw = Math.ceil(width / 16), mh = Math.ceil(height / 16), fs = mw * mh;
-  for (const [idc, maxFS, maxMBPS] of AVC_LEVELS) {
+  for (const [idc, maxFS, maxMBPS, maxBR] of AVC_LEVELS) {
     const maxDim = Math.sqrt(maxFS * 8);
-    if (fs <= maxFS && fs * fps <= maxMBPS && mw <= maxDim && mh <= maxDim) return idc;
+    if (fs <= maxFS && fs * fps <= maxMBPS && mw <= maxDim && mh <= maxDim && bitrate <= maxBR * 1000) return idc;
   }
   return 0;
 }
@@ -207,6 +226,24 @@ function repairAvcC(desc, keyData) {
   for (const s of pps) out.push(s.length >> 8, s.length & 255, ...s);
   if (sps[0][1] === 100) out.push(0xFD, 0xF8, 0xF8, 0x00);   // High: 4:2:0, 8 bit, no SPS ext
   return { desc: new Uint8Array(out), repaired: true };
+}
+
+// Firefox's encoder starts every frame with an access unit delimiter (NAL type 9). MP4 does not
+// need one, and Firefox's own player then shows the frame after a keyframe when seeking to it
+// (every keyframe of a 90-frame test; the same stream without delimiters seeks exactly).
+function dropDelimiters(data, lengthSize = 4) {
+  const nals = nalUnits(data, lengthSize);
+  if (!nals.some(n => (n[0] & 31) === 9)) return data;
+  if (nals.reduce((s, n) => s + lengthSize + n.length, 0) !== data.length) return data;   // not parsed whole
+  const keep = nals.filter(n => (n[0] & 31) !== 9);
+  const out = new Uint8Array(keep.reduce((s, n) => s + lengthSize + n.length, 0));
+  let p = 0;
+  for (const n of keep) {
+    for (let k = lengthSize - 1, len = n.length; k >= 0; k--, len >>>= 8) out[p + k] = len & 255;
+    out.set(n, p + lengthSize);
+    p += lengthSize + n.length;
+  }
+  return out;
 }
 
 // The colr box is written from decoderConfig.colorSpace; mp4-muxer turns values outside its
@@ -304,6 +341,73 @@ async function measureColour(config, acceleration) {
   return { worst: Math.round(worst), skewed: worst > 20 };
 }
 
+// ------------------------------------------------------------------------------ MP4 edit list
+// A B-frame track is written the way ffmpeg writes x264 output, which Chromium, Firefox and
+// ffmpeg all seek frame-exactly: decode times 0, 1, 2 ... frames, presentation times D frames
+// later (D = reorder depth), and an edit list that starts the presentation at media time D.
+// (Without the shift, the first B-frames force uneven decode steps; Chromium takes a sample's
+// decode step as its duration and looks keyframes up by decode time, so seeks next to keyframes
+// showed a neighbouring frame.) mp4-muxer writes no edit list, so one is inserted after tkhd; moov
+// grows by 36 bytes and the chunk offsets into mdat (which follows moov) move with it. Movie and
+// track header durations become `seconds` (what is shown), the media header the stts sum.
+// Returns null for a layout it does not expect.
+function addEditList(u8, shiftSeconds, seconds) {
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const boxes = (start, end) => {
+    const out = {};
+    for (let p = start; p + 8 <= end;) {
+      let size = dv.getUint32(p), hdr = 8;
+      if (size === 1) { size = Number(dv.getBigUint64(p + 8)); hdr = 16; } else if (size === 0) size = end - p;
+      if (size < hdr || p + size > end) break;
+      out[String.fromCharCode(u8[p + 4], u8[p + 5], u8[p + 6], u8[p + 7])] ??= { at: p, end: p + size, hdr };
+      p += size;
+    }
+    return out;
+  };
+  const inside = (b, ...names) => {
+    for (const name of names) {
+      if (!b || b.hdr !== 8) return null;
+      b = boxes(b.at + 8, b.end)[name];
+    }
+    return b;
+  };
+  const moov = boxes(0, u8.length).moov, trak = inside(moov, 'trak'), mvhd = inside(moov, 'mvhd');
+  const tkhd = inside(trak, 'tkhd'), mdia = inside(trak, 'mdia'), mdhd = inside(mdia, 'mdhd');
+  const stbl = inside(mdia, 'minf', 'stbl'), stts = inside(stbl, 'stts');
+  const stco = inside(stbl, 'stco'), co = stco || inside(stbl, 'co64');
+  if (!mvhd || !tkhd || !mdhd || !stts || !co || inside(trak, 'edts')) return null;
+
+  // version 0 / 1 full boxes: 32 / 64-bit times
+  const v1 = b => u8[b.at + 8] === 1;
+  const scale = b => dv.getUint32(b.at + (v1(b) ? 28 : 20));
+  const setDuration = (b, at0, at1, x) => (v1(b) ? dv.setBigUint64(b.at + at1, BigInt(x)) : dv.setUint32(b.at + at0, x));
+  let sum = 0;
+  for (let k = 0, n = dv.getUint32(stts.at + 12); k < n; k++) sum += dv.getUint32(stts.at + 16 + k * 8) * dv.getUint32(stts.at + 20 + k * 8);
+  const shown = Math.round(seconds * scale(mvhd)), shift = Math.round(shiftSeconds * scale(mdhd));
+  if (!(shown > 0) || shown > 0xFFFFFFFF || !(shift > 0) || shift > 0x7FFFFFFF || sum > 0xFFFFFFFF) return null;
+  const EDTS = 36, ins = tkhd.end, wide = !stco, count = dv.getUint32(co.at + 12);
+  if (!wide && count && dv.getUint32(co.at + 16 + (count - 1) * 4) + EDTS > 0xFFFFFFFF) return null;
+  // nothing can fail from here on
+  setDuration(mvhd, 24, 32, shown);
+  setDuration(tkhd, 28, 36, shown);
+  setDuration(mdhd, 24, 32, sum);
+
+  const out = new Uint8Array(u8.length + EDTS), o = new DataView(out.buffer);
+  out.set(u8.subarray(0, ins));
+  out.set(u8.subarray(ins), ins + EDTS);
+  o.setUint32(ins, EDTS); out.set([0x65, 0x64, 0x74, 0x73], ins + 4);            // edts
+  o.setUint32(ins + 8, EDTS - 8); out.set([0x65, 0x6C, 0x73, 0x74], ins + 12);   // elst, version 0
+  o.setUint32(ins + 20, 1);                                                        // one entry:
+  o.setUint32(ins + 24, shown); o.setInt32(ins + 28, shift); o.setUint16(ins + 32, 1);   // length, start, rate 1
+  for (const b of [moov, trak]) o.setUint32(b.at, o.getUint32(b.at) + EDTS);
+  for (let k = 0, at = co.at + EDTS; k < count; k++) {   // chunk offsets ascend: the last is the largest
+    const q = at + 16 + k * (wide ? 8 : 4);
+    if (wide) o.setBigUint64(q, o.getBigUint64(q) + BigInt(EDTS));
+    else o.setUint32(q, o.getUint32(q) + EDTS);
+  }
+  return out;
+}
+
 // ------------------------------------------------------------------------------ probing
 async function isSupported(config) {
   try { return !!(await VideoEncoder.isConfigSupported(config)).supported; } catch { return false; }
@@ -311,7 +415,7 @@ async function isSupported(config) {
 
 async function pickWebCodecs(width, height, fps, bitrate) {
   if (typeof VideoEncoder === 'undefined' || typeof VideoFrame === 'undefined' || !VideoEncoder.isConfigSupported) return null;
-  const level = avcLevel(width, height, fps);
+  const level = avcLevel(width, height, fps, bitrate);
   if (!level || width % 2 || height % 2) return null;
   const base = { width, height, bitrate, framerate: fps, avc: { format: 'avc' } };
   // bitrateMode 'variable' is the spec default; say it explicitly, but do not let an
@@ -327,15 +431,60 @@ async function pickWebCodecs(width, height, fps, bitrate) {
   return null;
 }
 
-function pickRecorder(types = RECORDER_TYPES) {
+// Software encoders get constant rate control. Firefox's (Media Foundation) ignores the bitrate
+// in every mode, but in 'variable' it keeps stale blocks behind moving things (faint trails on
+// flat paper, up to 35 levels off); 'constant' leaves about a quarter of them. Chrome's OpenH264
+// writes byte-identical files in both modes. Hardware encoders stay on 'variable' (Chrome + NVENC
+// in 'constant' starves the first frames).
+async function softwareConfig(pick) {
+  if (!pick.soft) {
+    pick.soft = (async () => {
+      if (pick.config.bitrateMode !== 'variable') return pick.config;
+      const cbr = { ...pick.config, bitrateMode: 'constant' };
+      return (await isSupported(cbr)) ? cbr : pick.config;
+    })();
+  }
+  return pick.soft;
+}
+
+// The codec a recorder MIME type implies, as a WebCodecs string, to ask VideoEncoder whether this
+// size can be encoded with it: false when no H.264 level fits, null when the codec is unknown.
+function recorderCodec(type, width, height, fps) {
+  const t = type.toLowerCase();
+  if (/avc[13]|h264/.test(t) || (t.startsWith('video/mp4') && !t.includes('codecs='))) {
+    const level = avcLevel(width, height, fps);
+    return level ? `avc1.42E0${level.toString(16).toUpperCase().padStart(2, '0')}` : false;
+  }
+  if (/vp0?9/.test(t)) return 'vp09.00.10.08';
+  if (/vp8/.test(t)) return 'vp8';
+  if (/av01|av1/.test(t)) return 'av01.0.04M.08';
+  return null;
+}
+
+// MediaRecorder cannot be asked whether it can record a given size, and Chrome's accepts sizes
+// its H.264 encoder then rejects at run time (2x2, 4x4, 4096x4096). Where WebCodecs exists, its
+// answer for the same codec predicts that exactly (Chrome records with the same encoders), so the
+// first type it does not rule out is preferred. It only reorders: if it rules out every type, the
+// first one is still tried, and a failure then surfaces as 'unsupported'.
+async function pickRecorder(types = RECORDER_TYPES, size = null) {
   if (typeof MediaRecorder === 'undefined' || typeof HTMLCanvasElement === 'undefined' ||
       !HTMLCanvasElement.prototype.captureStream) return null;
-  for (const type of types) {
-    let ok = false;
-    try { ok = MediaRecorder.isTypeSupported(type); } catch { /* treat as unsupported */ }
-    if (ok) return { mimeType: type, ext: type.startsWith('video/mp4') ? 'mp4' : 'webm' };
+  // Real time cannot keep up beyond UHD: Chrome kept 22 of 60 frames at 4096 x 4096 (VP9),
+  // Firefox 1 of 3 at 8192 x 8192. A file with most frames missing is not a result.
+  if (size && size.width * size.height > MAX_RECORDER_PX) return null;
+  const candidates = types.filter(type => {
+    try { return MediaRecorder.isTypeSupported(type); } catch { return false; }
+  });
+  if (!candidates.length) return null;
+  let mimeType = candidates[0];
+  if (size && typeof VideoEncoder !== 'undefined' && VideoEncoder.isConfigSupported) {
+    const { width, height, fps } = size;
+    for (const type of candidates) {
+      const codec = recorderCodec(type, width, height, fps);
+      if (codec === null || (codec && await isSupported({ codec, width, height, framerate: fps }))) { mimeType = type; break; }
+    }
   }
-  return null;
+  return { mimeType, ext: mimeType.startsWith('video/mp4') ? 'mp4' : 'webm' };
 }
 
 /** What this browser can do for a given size: { webcodecs: {codec, hardware}|null, recorder: {mimeType, ext}|null } */
@@ -343,7 +492,7 @@ export async function probeVideo({ width = 1080, height = 1920, fps = 30, bitrat
   const wc = await pickWebCodecs(width, height, fps, bitrate || defaultBitrate(width, height, fps));
   // Start the one-off colour check for this size now (cached), so the export itself starts at once.
   if (wc) colourCheck(wc.config, 'no-preference');
-  return { webcodecs: wc && { codec: wc.codec, hardware: wc.hardware }, recorder: pickRecorder() };
+  return { webcodecs: wc && { codec: wc.codec, hardware: wc.hardware }, recorder: await pickRecorder(RECORDER_TYPES, { width, height, fps }) };
 }
 
 // ------------------------------------------------------------------------------ public entry
@@ -364,15 +513,19 @@ export async function encodeVideo(opts) {
   checkAbort(signal);
 
   const asked = Math.round(opts.bitrate);
-  const job = { width, height, fps, frames, drawFrame, signal, onProgress,
-    bitrate: asked > 0 ? asked : defaultBitrate(width, height, fps) };
+  const keyFrames = new Set((Array.isArray(opts.keyFrames) ? opts.keyFrames : [])
+    .filter(k => Number.isInteger(k) && k >= 0 && k < frames));
+  const job = { width, height, fps, frames, drawFrame, signal, onProgress, keyFrames,
+    bitrate: asked > 0 ? asked : defaultBitrate(width, height, fps), restarts: 0 };
+  // Starting over (software retry, recorder fallback): the UI hears it at once, as progress 0.
+  job.restart = () => { job.restarts++; progress(onProgress, 0, frames, null); };
 
   let wcError = null;
   if (engine !== 'recorder') {
     const wc = await pickWebCodecs(width, height, fps, job.bitrate);
     if (wc) {
       try {
-        return await encodeWebCodecs(job, wc);
+        return Object.assign(await encodeWebCodecs(job, wc), { restarts: job.restarts });
       } catch (e) {
         // Only an encoder failure is worth a second, real-time attempt; a cancel or a
         // drawFrame error would just happen again.
@@ -383,13 +536,16 @@ export async function encodeVideo(opts) {
       throw fail('unsupported', `This browser cannot encode H.264 video at ${width} x ${height}`);
     }
   }
-  const rec = pickRecorder(recorderTypes);
+  const rec = await pickRecorder(recorderTypes, { width, height, fps });
+  checkAbort(signal);
   if (!rec) {
     if (wcError) throw wcError;
-    throw fail('unsupported', 'This browser cannot record video (no WebCodecs H.264 and no MediaRecorder)');
+    throw fail('unsupported', `This browser cannot make a ${width} x ${height} video (no WebCodecs H.264 encoder for it, and no MediaRecorder that can record it)`);
   }
+  if (wcError) job.restart();
   const out = await encodeRecorder(job, rec);
   if (wcError) out.fallbackFrom = msg(wcError);
+  out.restarts = job.restarts;
   return out;
 }
 
@@ -413,6 +569,7 @@ async function encodeWebCodecs(job, pick) {
     // A hardware encoder can accept a config and still fail once frames arrive (driver limits,
     // GPU reset). Software is slower but dependable.
     if (!(await isSupported({ ...pick.config, hardwareAcceleration: 'prefer-software' }))) throw e;
+    job.restart();
     const out = await pass('prefer-software');
     out.retriedAfter = msg(e);
     return out;
@@ -420,62 +577,67 @@ async function encodeWebCodecs(job, pick) {
 }
 
 async function webCodecsPass(job, pick, { Muxer, ArrayBufferTarget }, acceleration, colour) {
-  const { width, height, fps, frames, drawFrame, signal, onProgress } = job;
+  const { width, height, fps, frames, drawFrame, signal, onProgress, keyFrames } = job;
   const startedAt = performance.now();
   const encoderError = (text, cause) => Object.assign(fail('encode', text, cause), { fromEncoder: true });
   const frameUs = 1e6 / fps;
 
+  // Software encoders: constant rate control (see softwareConfig) and a one-second warm-up. The
+  // rate control of Firefox's encoder settles during its first second; until then it leaves
+  // strong trails (79 levels off where the steady state has 23). So it is first fed `warm` copies
+  // of frame 0 (timestamps 0 .. warm-1 frames), whose output is dropped; real frame i follows at
+  // warm + i and frame 0 is a keyframe, so nothing kept refers to the warm-up. Cost: `warm` encodes
+  // of one still picture (~0.1-0.3 s).
+  const soft = acceleration === 'prefer-software' || !pick.hardware;
+  const config = soft ? await softwareConfig(pick) : pick.config;
+  checkAbort(signal);
+  const warm = soft ? Math.min(60, Math.max(8, Math.round(fps))) : 0;
+
   // Muxing. Encoders differ in what they hand back: Chrome returns frames in order with our
   // timestamps; Firefox (Media Foundation) uses B-frames, so chunks arrive in decode order, and
   // stamps them one frame late in 100 ns steps. So each chunk is mapped back to its frame index
-  // p (relative to the earliest timestamp), and decode times are synthesised from the output
-  // position k and the reorder depth D, measured over the first second of output:
-  //   DTS_k = max(k - D, k / (D + 1)) frames
-  // which is strictly increasing, never after its PTS, and starts at 0 with frame 0 shown at
-  // t = 0 (no edit list needed; mp4-muxer writes none). The track timescale fps * (D + 1) makes
-  // every value an exact tick. D = 0 (no B-frames) gives DTS = PTS, 1 tick per frame.
-  // The last chunk is held back until the end: the stts sum (which ffprobe and many players take
-  // as the duration) must match mvhd/mdhd, i.e. end where the last frame's display ends. mp4-muxer
-  // gives the final sample the previous sample's delta, so the final DTS goes halfway between the
-  // previous DTS and that end (half-frame ticks: timescale 2 * fps * (D + 1) when D > 0).
+  // p (relative to the earliest timestamp), and the reorder depth D (how far the output position
+  // k runs ahead of p) is measured over the first second of output. Then, as ffmpeg writes x264
+  // files: decode time k, presentation time p + D (in frames; never before the decode time), and
+  // with D > 0 an edit list that shows media time D as t = 0 (see addEditList). Every sample lasts
+  // one frame, so the stts sum is the length whichever frame comes last in decode order (a B-frame
+  // after an odd frame count or a forced keyframe). D = 0 (no B-frames): DTS = PTS, no edit list.
   const lookahead = Math.min(frames, Math.max(8, Math.round(fps)));
   const early = [];
-  let target = null, muxer = null, base = 0, depth = 0, muxed = 0, pending = null, maxP = -Infinity, prevD = 0;
+  let target = null, muxer = null, base = 0, depth = 0, muxed = 0, maxP = -1;
   const openMuxer = () => {
     base = Math.min(...early.map(c => c.ts));
     early.forEach((c, k) => { depth = Math.max(depth, k - Math.round((c.ts - base) / frameUs)); });
     target = new ArrayBufferTarget();
+    // Track timescale: a power-of-two multiple of fps of at least 10000 ticks/s, as ffmpeg picks
+    // (15360 at 30 fps). With one tick per frame, Chromium rounded a seek target to the nearest
+    // frame boundary: a seek into the late half of the frame before a keyframe showed the keyframe.
+    let timescale = fps;
+    while (timescale < 10000) timescale *= 2;
     muxer = new Muxer({
       target,
-      video: { codec: 'avc', width, height, ...(Number.isInteger(fps) ? { frameRate: fps * (depth + 1) * (depth ? 2 : 1) } : {}) },
+      video: { codec: 'avc', width, height, ...(Number.isInteger(fps) ? { frameRate: timescale } : {}) },
       fastStart: 'in-memory',
       firstTimestampBehavior: 'offset',
     });
-    const all = early.splice(0);
-    pending = all.pop();
-    for (const c of all) mux(c);
+    for (const c of early.splice(0)) mux(c);
   };
-  const mux = (c, final = false) => {
+  const mux = c => {
     const k = muxed, p = Math.round((c.ts - base) / frameUs);
-    let d = Math.max(k - depth, k / (depth + 1));
-    if (final && k > 0) {
-      const end = Math.max(maxP, p) + 1, mid = (end + prevD) / 2;
-      if (mid <= p + 1e-9) d = Math.max(d, mid);
-      else if (p + 1 === end) d = p;   // cannot be exact here; closest is the last shown frame at its own time
-    }
-    if (p < 0 || d > p + 1e-9) throw new Error(`frame reordering deeper than ${depth} at output ${k}`);
-    muxer.addVideoChunkRaw(c.data, c.type, p * frameUs, frameUs, c.meta, (p - d) * frameUs);
+    if (p < 0 || k > p + depth) throw new Error(`frame reordering deeper than ${depth} at output ${k}`);
+    muxer.addVideoChunkRaw(c.data, c.type, (p + depth) * frameUs, frameUs, c.meta, (p + depth - k) * frameUs);
     maxP = Math.max(maxP, p);
-    prevD = d;
     muxed++;
   };
 
   let failure = null, chunks = 0, lastOutput = performance.now(), codec = pick.codec, avcCRepaired = false;
+  let firstTs = null, heldConfig = null, mp4 = null, nalLength = 4;
   // An encoder that gets canvas colours wrong is fed I420 we convert ourselves (see measureColour).
   const manualYuv = !!colour?.skewed;
   const encoder = new VideoEncoder({
     output: (chunk, meta) => {
       try {
+        lastOutput = performance.now();
         const data = new Uint8Array(chunk.byteLength);
         chunk.copyTo(data);
         if (meta?.decoderConfig) {
@@ -484,10 +646,19 @@ async function webCodecsPass(job, pick, { Muxer, ArrayBufferTarget }, accelerati
           meta = { ...meta, decoderConfig: { ...meta.decoderConfig, description: fixed.desc,
             colorSpace: manualYuv ? BT709 : cleanColorSpace(meta.decoderConfig.colorSpace) } };
           codec = codecFromAvcC(fixed.desc) || codec;
+          nalLength = parseAvcC(fixed.desc)?.lengthSize || nalLength;
         }
-        const c = { data, type: chunk.type, ts: chunk.timestamp, meta };
-        chunks++; lastOutput = performance.now();
-        if (muxer) { mux(pending); pending = c; }
+        // The first chunk out is the first keyframe, the earliest picture: warm-up frames are
+        // counted from it. Dropped, but the stream header they carry goes with the first real frame.
+        firstTs ??= chunk.timestamp;
+        if (warm && Math.round((chunk.timestamp - firstTs) / frameUs) < warm) {
+          if (meta?.decoderConfig) heldConfig = meta;
+          return;
+        }
+        if (heldConfig) { if (!meta?.decoderConfig) meta = heldConfig; heldConfig = null; }
+        const c = { data: dropDelimiters(data, nalLength), type: chunk.type, ts: chunk.timestamp, meta };
+        chunks++;
+        if (muxer) mux(c);
         else { early.push(c); if (early.length >= lookahead) openMuxer(); }
       } catch (e) { failure ||= e; }
     },
@@ -521,11 +692,48 @@ async function webCodecsPass(job, pick, { Muxer, ArrayBufferTarget }, accelerati
     timer = setTimeout(done, 30);   // 'dequeue' is not everywhere; the caller re-checks
   });
 
+  // Hands the picture on the canvas to the encoder as the frame at `slot` (in frame periods).
+  // On the I420 path the conversion is done once per painted picture (`convert`).
+  const encodeAt = (slot, keyFrame, convert, label) => {
+    let frame;
+    try {
+      const timing = { timestamp: Math.round(slot * frameUs), duration: Math.round(frameUs) };
+      if (manualYuv && convert) rgbaToI420(ctx.getImageData(0, 0, width, height).data, width, height, yuv);
+      frame = manualYuv
+        ? new VideoFrame(yuv, { ...timing, format: 'I420', codedWidth: width, codedHeight: height, colorSpace: BT709 })
+        : new VideoFrame(canvas, timing);
+      encoder.encode(frame, { keyFrame });
+    } catch (e) {
+      throw encoderError(`${label} could not be encoded: ${msg(failure || e)}`, failure || e);
+    } finally {
+      frame?.close();
+    }
+  };
+  const settle = async label => {
+    const queuedAt = performance.now();
+    while (encoder.encodeQueueSize > MAX_QUEUE && !failure && !signal?.aborted) {
+      await drain();
+      if (performance.now() - Math.max(queuedAt, lastOutput) > STALL_MS) {
+        throw encoderError(`Video encoder stopped responding at ${label}`);
+      }
+    }
+    await breathe.next();
+  };
+
   try {
     try {
-      encoder.configure({ ...pick.config, hardwareAcceleration: acceleration });
+      encoder.configure({ ...config, hardwareAcceleration: acceleration });
     } catch (e) {
       throw encoderError(`Video encoder rejected the configuration: ${msg(e)}`, e);
+    }
+    if (warm) {
+      await paint(drawFrame, 0, ctx, canvas, signal);
+      for (let k = 0; k < warm; k++) {
+        checkAbort(signal);
+        checkFailure();
+        encodeAt(k, k === 0, k === 0, 'The warm-up frame');
+        await settle('warm-up');
+      }
     }
     for (let i = 0; i < frames; i++) {
       checkAbort(signal);
@@ -535,29 +743,10 @@ async function webCodecsPass(job, pick, { Muxer, ArrayBufferTarget }, accelerati
       const t1 = performance.now();
       checkAbort(signal);
       checkFailure();
-      let frame;
-      try {
-        const timing = { timestamp: Math.round(i * frameUs), duration: Math.round(frameUs) };
-        frame = manualYuv
-          ? new VideoFrame(rgbaToI420(ctx.getImageData(0, 0, width, height).data, width, height, yuv),
-            { ...timing, format: 'I420', codedWidth: width, codedHeight: height, colorSpace: BT709 })
-          : new VideoFrame(canvas, timing);
-        encoder.encode(frame, { keyFrame: i % keyEvery === 0 });
-      } catch (e) {
-        throw encoderError(`Frame ${i} could not be encoded: ${msg(failure || e)}`, failure || e);
-      } finally {
-        frame?.close();
-      }
+      encodeAt(warm + i, i % keyEvery === 0 || keyFrames.has(i), true, `Frame ${i}`);
       const t2 = performance.now();
-      onProgress?.(i + 1, frames, canvas);
-      const queuedAt = performance.now();
-      while (encoder.encodeQueueSize > MAX_QUEUE && !failure && !signal?.aborted) {
-        await drain();
-        if (performance.now() - Math.max(queuedAt, lastOutput) > STALL_MS) {
-          throw encoderError(`Video encoder stopped responding at frame ${i}`);
-        }
-      }
-      await breathe.next();
+      progress(onProgress, i + 1, frames, canvas);
+      await settle(`frame ${i}`);
       spent.draw += t1 - t0; spent.frame += t2 - t1; spent.wait += performance.now() - t2;
     }
     checkAbort(signal);
@@ -579,20 +768,23 @@ async function webCodecsPass(job, pick, { Muxer, ArrayBufferTarget }, accelerati
     if (!chunks) throw encoderError('Video encoder returned no frames');
     try {
       if (!muxer) openMuxer();
-      mux(pending, true);
       muxer.finalize();
+      mp4 = new Uint8Array(target.buffer);
+      if (depth) mp4 = addEditList(mp4, depth / fps, (maxP + 1) / fps);
+      if (!mp4) throw new Error('unexpected MP4 layout for the edit list');
     } catch (e) { throw encoderError(`MP4 could not be written: ${msg(e)}`, e); }
   } finally {
     breathe.stop();
     if (encoder.state !== 'closed') { try { encoder.close(); } catch { /* already closed */ } }
   }
 
-  const blob = new Blob([target.buffer], { type: 'video/mp4' });
+  const blob = new Blob([mp4], { type: 'video/mp4' });
   return {
     startedAt,
     blob, mimeType: 'video/mp4', ext: 'mp4', engine: 'webcodecs', codec,
     width, height, fps, frames, bytes: blob.size,
-    bitrate: job.bitrate, acceleration, hardware: pick.hardware, encodedFrames: chunks, reorderDepth: depth,
+    bitrate: job.bitrate, bitrateMode: config.bitrateMode || null, acceleration, hardware: pick.hardware,
+    warmupFrames: warm, encodedFrames: chunks, reorderDepth: depth,
     colourPath: manualYuv ? 'i420' : 'canvas', colourCheck: colour ? colour.worst : null, avcCRepaired,
     perFrameMs: Object.fromEntries(Object.entries(spent).map(([k, v]) => [k, +(v / frames).toFixed(2)])),
   };
@@ -633,21 +825,27 @@ async function encodeRecorder(job, pick) {
   }
 
   const parts = [];
-  let failure = null;
+  let failure = null, onFailure = null;
   rec.ondataavailable = e => { if (e.data && e.data.size) parts.push(e.data); };
   const stopped = new Promise(resolve => { rec.onstop = resolve; });
-  rec.onerror = e => { failure ||= e.error || e; };
+  rec.onerror = e => { failure ||= e.error || e; onFailure?.(); };
+  // A recorder that fails before it delivered any data never ran this configuration: Chrome
+  // accepts sizes its H.264 encoder rejects and reports an EncodingError right after 'start'.
+  // That is 'unsupported'; a failure after data arrived is 'encode'.
+  const recorderFailed = () => (parts.length
+    ? fail('encode', `Video recorder failed: ${msg(failure)}`, failure)
+    : fail('unsupported', `This browser cannot record ${width} x ${height} video as ${pick.mimeType}: ${msg(failure)}`, failure));
 
   // Clock that stands still while the tab is hidden (the recorder is paused then too).
   const hasDoc = typeof document !== 'undefined';
-  let t0 = 0, hiddenAt = 0, hiddenMs = 0, wake = null;
+  let t0 = 0, hiddenAt = 0, hiddenMs = 0, wake = null, running = false;
   const now = () => (hiddenAt || performance.now()) - t0 - hiddenMs;
+  const pause = () => { if (rec.state === 'recording') { rec.pause(); hiddenAt = performance.now(); } };
+  // Listening from the very start: a tab that is hidden before or during the recorder's start-up
+  // must still wake the export when it is shown again. Pausing only once the clock runs.
   const onVisibility = () => {
-    if (document.hidden) {
-      if (rec.state === 'recording') { rec.pause(); hiddenAt = performance.now(); }
-    } else {
-      wake?.();
-    }
+    if (!document.hidden) wake?.();
+    else if (running) pause();
   };
   const whileHidden = () => new Promise(resolve => {
     const done = () => { wake = null; signal?.removeEventListener('abort', done); resolve(); };
@@ -655,6 +853,7 @@ async function encodeRecorder(job, pick) {
     signal?.addEventListener('abort', done, { once: true });
     if (!document.hidden) done();
   });
+  if (hasDoc) document.addEventListener('visibilitychange', onVisibility);
 
   const cleanup = () => {
     if (hasDoc) document.removeEventListener('visibilitychange', onVisibility);
@@ -671,16 +870,19 @@ async function encodeRecorder(job, pick) {
     // only then start the clock. Frame 0 is held for that start-up time (a still lead-in, reported
     // as leadInMs). A cold first recorder in a page can still lose ~2 early frames inside Chrome;
     // the timeline stays right.
-    const started = new Promise(resolve => { rec.onstart = resolve; setTimeout(resolve, 3000); });
+    const started = new Promise(resolve => { rec.onstart = resolve; onFailure = resolve; setTimeout(resolve, 3000); });
     rec.start(1000);
     await paint(drawFrame, 0, ctx, canvas, signal);
     const firstPush = performance.now();
     push();
     await raceAbort(started, signal);
-    if (hasDoc) document.addEventListener('visibilitychange', onVisibility);
+    if (failure) throw recorderFailed();
     t0 = performance.now();
     leadInMs = Math.round(t0 - firstPush);
-    onProgress?.(1, frames, canvas);
+    running = true;
+    // Hidden during start-up: pause at once; the loop below waits, resumes and repaints frame 0.
+    if (hasDoc && document.hidden) pause();
+    progress(onProgress, 1, frames, canvas);
 
     let i = 0, lastPush = performance.now();
     while (i < frames - 1) {
@@ -689,7 +891,7 @@ async function encodeRecorder(job, pick) {
       const due = Math.max((i + 1) * frameMs - now(), minGap - (performance.now() - lastPush));
       if (due > 1) await sleep(due);
       checkAbort(signal);
-      if (failure) throw fail('encode', `Video recorder failed: ${msg(failure)}`, failure);
+      if (failure) throw recorderFailed();
       if (rec.state === 'paused') {
         await whileHidden();
         checkAbort(signal);
@@ -719,7 +921,7 @@ async function encodeRecorder(job, pick) {
       push();
       lastPush = performance.now();
       drawn++;
-      onProgress?.(i + 1, frames, canvas);
+      progress(onProgress, i + 1, frames, canvas);
     }
     // Hold the last frame for its full duration before stopping.
     await sleep(frameMs * 1.5);
@@ -734,13 +936,14 @@ async function encodeRecorder(job, pick) {
     throw coded(e) ? e : fail('encode', `Video recording failed: ${msg(e)}`, e);
   }
   cleanup();
-  if (failure) throw fail('encode', `Video recorder failed: ${msg(failure)}`, failure);
+  if (failure) throw recorderFailed();
 
   const actualType = rec.mimeType || pick.mimeType;
   const container = actualType.startsWith('video/mp4') ? 'video/mp4' : 'video/webm';
   const codecMatch = /codecs="?([^";]+)/i.exec(actualType) || /codecs="?([^";]+)/i.exec(pick.mimeType);
   let blob = new Blob(parts, { type: container });
-  if (!blob.size) throw fail('encode', 'The video recorder produced an empty file');
+  // Nothing at all, and no error: the recorder never got going with this configuration.
+  if (!blob.size) throw fail('unsupported', `This browser recorded nothing at ${width} x ${height} (${pick.mimeType})`);
   let durationPatched = false, durationMs = Math.round(frames * frameMs + leadInMs);
   if (container === 'video/webm') {
     const fixed = fixWebmDuration(new Uint8Array(await blob.arrayBuffer()), { frameMs, fallbackMs: durationMs });

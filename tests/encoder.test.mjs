@@ -1,6 +1,6 @@
 // Encoder test: drives dev/enc.html in real browsers, then checks every produced file with
 // ffprobe / ffmpeg and the raw bytes. Prints a pass/fail table; exit code 1 on any failure.
-//   node tests/encoder.test.mjs                 all runs (about 2-3 minutes)
+//   node tests/encoder.test.mjs                 all runs (about 5 minutes)
 //   node tests/encoder.test.mjs --only chromium,firefox --fast   (skip the 15 s speed runs)
 // Needs the dev server on :8830 and ffmpeg/ffprobe on PATH. Files land in shots/enc_*.
 import { createRequire } from 'node:module';
@@ -23,18 +23,21 @@ const PORT = +opt('port', 8830);
 const FPS = 30;
 const PATCHES = ['#ff0000', '#00ff00', '#0000ff', '#808080', '#ffffff', '#000000', '#c43d16', '#17171a'];
 const COLOR_TOL = 12;   // max channel error on flat patches after 4:2:0 limited-range round trip
+const TRAIL_TOL = 30;   // max channel error on flat paper behind a moving dot (see trails())
 
 const GPU_ARGS = ['--use-angle=d3d11', '--enable-gpu', '--ignore-gpu-blocklist'];
 const RUNS = [
-  { id: 'chromium', browser: 'chromium', engine: 'auto', tag: 'cr', cases: 'tall,square,wide,noraf,odd,drawerr,abort' },
+  { id: 'chromium', browser: 'chromium', engine: 'auto', tag: 'cr', cases: 'tall,square,wide,tall60,noraf,odd,drawerr,abort,odd75,keys,flat,progthrow,sizes,hidefall' },
   { id: 'chromium-speed', browser: 'chromium', engine: 'auto', tag: 'cr', cases: 'speed,real', slow: true },
-  { id: 'chromium-recorder', browser: 'chromium', engine: 'recorder', tag: 'crrec', cases: 'tall,square,hidden,abort,drawerr' },
-  { id: 'chromium-webm', browser: 'chromium', engine: 'recorder', tag: 'crwebm', cases: 'tall', types: 'webm' },
-  { id: 'edge', browser: 'chromium', channel: 'msedge', engine: 'auto', tag: 'edge', cases: 'tall' },
-  { id: 'firefox', browser: 'firefox', engine: 'auto', tag: 'ff', cases: 'tall,square,noraf,odd,drawerr,abort' },
+  { id: 'chromium-recorder', browser: 'chromium', engine: 'recorder', tag: 'crrec', cases: 'tall,square,hidden,hiddenstart,abort,drawerr,progthrow' },
+  // Chrome's software VP9 recorder at 1080x1920 falls behind real time for a moment early on when
+  // the machine is busy: 1-3 dropped frames (between 10 and 18) in 7 runs. dropTol allows 3.
+  { id: 'chromium-webm', browser: 'chromium', engine: 'recorder', tag: 'crwebm', cases: 'tall', types: 'webm', dropTol: 3 },
+  { id: 'edge', browser: 'chromium', channel: 'msedge', engine: 'auto', tag: 'edge', cases: 'tall,tall60,odd75' },
+  { id: 'firefox', browser: 'firefox', engine: 'auto', tag: 'ff', cases: 'tall,square,tall60,noraf,odd,drawerr,abort,odd75,keys,flat,progthrow,sizes,hidefall' },
   { id: 'firefox-speed', browser: 'firefox', engine: 'auto', tag: 'ff', cases: 'speed', slow: true },
-  { id: 'firefox-recorder', browser: 'firefox', engine: 'recorder', tag: 'ffrec', cases: 'tall,hidden,abort' },
-  { id: 'webkit', browser: 'webkit', engine: 'auto', tag: 'wk', cases: 'tall,odd' },
+  { id: 'firefox-recorder', browser: 'firefox', engine: 'recorder', tag: 'ffrec', cases: 'tall,hidden,hiddenstart,abort' },
+  { id: 'webkit', browser: 'webkit', engine: 'auto', tag: 'wk', cases: 'tall,odd,progthrow,sizes' },
 ];
 
 // ------------------------------------------------------------------ browser driving
@@ -135,12 +138,23 @@ function mp4Durations(buf) {
   const st = stbl.stts[0] + 12, n = buf.readUInt32BE(st);
   let sum = 0;
   for (let k = 0; k < n; k++) sum += buf.readUInt32BE(st + 4 + k * 8) * buf.readUInt32BE(st + 8 + k * 8);
-  return {
+  const out = {
     mvhd: u(mv.o + (mv.v ? 20 : 12), mv.v) / mvScale,
     tkhd: u(tk.o + (tk.v ? 24 : 16), tk.v) / mvScale,
     mdhd: u(md.o + (md.v ? 20 : 12), md.v) / mdScale,
     stts: sum / mdScale,
   };
+  // edit list (B-frame tracks): [{ length s, start s (media time shown at t = 0) }], not enumerable
+  let edits = null;
+  if (trak.edts) {
+    const el = kids(trak.edts[0] + 8, trak.edts[1]).elst, v = buf[el[0] + 8], n = buf.readUInt32BE(el[0] + 12);
+    edits = [];
+    for (let k = 0, p = el[0] + 16; k < n; k++, p += v ? 20 : 12) {
+      edits.push({ length: u(p, v) / mvScale, start: (v ? Number(buf.readBigInt64BE(p + 8)) : buf.readInt32BE(p + 4)) / mdScale });
+    }
+  }
+  Object.defineProperty(out, 'edits', { value: edits });
+  return out;
 }
 
 // Decode every frame's barcode (top band, 20 cells) with ffmpeg in presentation order.
@@ -173,6 +187,38 @@ function patchErrors(file, W, H, n) {
   });
 }
 
+// Flat paper + one moving dot (dev/enc.js flatDot): every 6th frame, how far pixels away from the
+// dot (and below the barcode band) are from the paper colour. What is there is left-over encoder
+// trail: Firefox's software H.264 in 'variable' mode reached 44 levels, 'constant' + warm-up 21.
+function trails(file, W, H) {
+  const raw = ff('ffmpeg', ['-v', 'error', '-i', file, '-vf', "select='not(mod(n\\,6))'", '-fps_mode', 'passthrough',
+    '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-']);
+  const BG = [0xf3, 0xec, 0xdf], F = W * H * 3, top = Math.round(W * 0.06) + 8;
+  let worst = 0, px = 0;
+  for (let f = 0, i = 0; f + F <= raw.length; f += F, i += 6) {
+    const cx = W / 2 + Math.cos(i / 15) * W * 0.3, cy = H / 2 + Math.sin(i / 15) * W * 0.3, r = 5 * W / 100 + 10;
+    for (let y = top; y < H; y += 2) for (let x = 0; x < W; x += 2) {
+      if ((x - cx) ** 2 + (y - cy) ** 2 < r * r) continue;
+      const o = f + (y * W + x) * 3;
+      const d = Math.max(Math.abs(raw[o] - BG[0]), Math.abs(raw[o + 1] - BG[1]), Math.abs(raw[o + 2] - BG[2]));
+      if (d > 4) px++;
+      if (d > worst) worst = d;
+    }
+  }
+  return { worst, px };
+}
+
+// Lowest H.264 level_idc (x10) whose MaxFS / MaxMBPS / frame-dimension limits fit (Table A-1),
+// written out here on purpose rather than imported from the encoder under test.
+const LEVELS = [[30, 1620, 40500], [31, 3600, 108000], [32, 5120, 216000], [40, 8192, 245760], [41, 8192, 245760],
+  [42, 8704, 522240], [50, 22080, 589824], [51, 36864, 983040], [52, 36864, 2073600], [60, 139264, 4177920],
+  [61, 139264, 8355840], [62, 139264, 16711680]];
+function minLevel(w, h, fps) {
+  const mw = Math.ceil(w / 16), mh = Math.ceil(h / 16), fs = mw * mh;
+  const hit = LEVELS.find(([, maxFS, mbps]) => fs <= maxFS && fs * fps <= mbps && Math.max(mw, mh) <= Math.sqrt(8 * maxFS));
+  return hit ? hit[0] : 0;
+}
+
 function checkFile(r, run) {
   const checks = [];
   const add = (name, ok, detail) => checks.push({ name, ok: !!ok, detail });
@@ -187,7 +233,6 @@ function checkFile(r, run) {
   const lead = (r.leadInMs || 0) / 1000;
   const expectDur = r.frames / r.fps + (r.engine === 'recorder' ? lead : 0);
   add('size', s.width === r.width && s.height === r.height, `${s.width}x${s.height}`);
-  // a full decode must be silent (a broken avcC, bad timestamps or corrupt slices all show here)
   // Decoding every frame must be silent: a broken avcC, bad slices or references show here.
   // (ffprobe decodes without re-muxing; 'ffmpeg -f null' would also flag its own 1/fps rounding
   // of variable-rate recorder timestamps, which is not a file problem.)
@@ -198,6 +243,11 @@ function checkFile(r, run) {
   if (r.engine === 'webcodecs') {
     const prof = { '64': 'High', '4D': 'Main', '42': 'Constrained Baseline' }[r.codec.slice(5, 7)];
     add('codec h264 ' + (prof || '?'), s.codec_name === 'h264' && s.profile === prof, `${s.codec_name} ${s.profile} L${s.level / 10}`);
+    // The level written in the SPS must allow this frame size and macroblock rate (H.264 Table
+    // A-1; a decoder may refuse a stream above its level), and the codec string must say the same.
+    const lvl = minLevel(r.width, r.height, r.fps);
+    add('level valid', lvl && s.level >= lvl && parseInt(r.codec.slice(9, 11), 16) === s.level,
+      `stream L${s.level / 10}, needs ≥ L${lvl / 10} for ${r.width}x${r.height}@${r.fps}, codec ${r.codec}`);
     add('nb_frames', +s.nb_frames === r.frames && decoded === r.frames, `${s.nb_frames} hdr / ${decoded} decoded`);
     add('duration exact', Math.abs(dur - expectDur) < 0.0005, `${dur.toFixed(4)} s (want ${expectDur.toFixed(4)})`);
     const atoms = mp4Atoms(buf);
@@ -205,6 +255,11 @@ function checkFile(r, run) {
     const box = mp4Durations(buf);
     add('mvhd = tkhd = mdhd = stts', Object.values(box).every(v => Math.abs(v - expectDur) < 0.0005),
       Object.entries(box).map(([k, v]) => `${k} ${v.toFixed(4)}`).join(', '));
+    // B-frames: decode times start at 0 and presentation D frames later, shifted back by an edit
+    // list (as ffmpeg writes x264 output); no B-frames: no edit list.
+    const e = box.edits, D = r.reorderDepth;
+    add('edit list', D ? e?.length === 1 && Math.abs(e[0].start - D / r.fps) < 1e-6 && Math.abs(e[0].length - expectDur) < 0.0005 : !e,
+      e ? e.map(x => `show ${x.length.toFixed(4)} s from media ${(x.start * 1000).toFixed(2)} ms`).join('; ') + ` (reorder depth ${D})` : `none (reorder depth ${D})`);
     // keyframes by presentation index (with B-frames, decode order differs)
     const pk = ff('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'packet=pts_time,flags', '-of', 'csv=p=0', file])
       .toString().trim().split(/\r?\n/).map(l => l.split(','));
@@ -215,6 +270,7 @@ function checkFile(r, run) {
     const gaps = keys.slice(1).map((k, i) => k - keys[i]);
     add('keyframe every 2 s', need.every(i => keys.includes(i)) && Math.max(0, ...gaps, r.frames - keys.at(-1)) <= 2 * r.fps,
       `keys ${keys.length > 8 ? keys.slice(0, 8).join(',') + ',…' : keys.join(',')}`);
+    if (r.keyFrames) add('forced keyframes', r.keyFrames.every(i => keys.includes(i)), `asked ${r.keyFrames.join(',')}, keys ${keys.join(',')}`);
   } else {
     add('codec', /h264|vp8|vp9/.test(s.codec_name), `${s.codec_name} ${s.profile || ''} in ${fmt.format_name}`);
     // tab hide: each pause/resume holds the current frame ~1-3 slots (Firefox re-sends a frame
@@ -235,10 +291,15 @@ function checkFile(r, run) {
   } else {
     // Real-time capture: the browser's recorder may drop a frame under load (seen: Chrome during a
     // slow hardware-encoder start, and software VP9 at 1080x1920). The timeline stays right; allow
-    // up to 3 % and report them. Order must hold and nothing may be unreadable.
-    const allowed = Math.max(2, Math.floor(r.frames * 0.03));
+    // up to 3 % and report them. Order must hold and nothing may be unreadable. Frames the
+    // encoder skipped itself (r.dropped: drawing fell behind the wall clock on a busy machine, so
+    // it jumps to the frame due now and the video keeps its length) are by design and allowed on
+    // top; they are reported separately.
+    const skipped = r.dropped || 0;
+    const allowed = Math.max(run.dropTol || 2, Math.floor(r.frames * 0.03)) + skipped;
     add('frames in order, ≤3% dropped', missing.length <= allowed && ordered && !bad,
-      `${ids.length} decoded, ${ids.length - seen.size} dup, dropped ${missing.length ? missing.length + ' (' + missing.slice(0, 6).join(',') + ')' : 'none'}`);
+      `${ids.length} decoded, ${ids.length - seen.size} dup, dropped ${missing.length ? missing.length + ' (' + missing.slice(0, 6).join(',') + ')' : 'none'}` +
+      (skipped ? `, ${skipped} skipped by the encoder to keep real time (${r.realtimeX}x)` : ''));
     // pacing: after the lead-in, frame times should be ~1/fps apart
     const pts = ff('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'frame=best_effort_timestamp_time', '-of', 'csv=p=0', file])
       .toString().trim().split(/\r?\n/).map(Number);
@@ -249,14 +310,27 @@ function checkFile(r, run) {
     // a tab hide holds the current frame 1-2 slots by design (see encodeRecorder)
     add('even pacing', Math.abs(med - 1 / r.fps) < 0.004 && worst < (r.case === 'hidden' ? 4 : 3 + missing.length) / r.fps, `median ${(med * 1000).toFixed(1)} ms, worst ${(worst * 1000).toFixed(0)} ms, first ${((pts[1] - pts[0]) * 1000).toFixed(0)} ms`);
   }
-  if (r.case !== 'real') {
+  if (r.case === 'hiddenstart' || r.case === 'hidefall') {
+    // Started in a hidden tab, shown after shownAtMs: the export must have waited and then finished.
+    add('waited for the tab, then finished', r.engine === 'recorder' && r.ms >= r.shownAtMs, `${r.engine}, ${r.ms} ms (tab shown at ${r.shownAtMs} ms)`);
+    if (r.case === 'hidefall') add('fell back to the recorder', !!r.fallbackFrom, r.fallbackFrom);
+  }
+  if (r.case === 'flat') {
+    const t = trails(file, r.width, r.height);
+    add('no encoder trails', t.worst <= TRAIL_TOL, `worst ${t.worst} levels off the paper behind the dot, ${t.px} px > 4 (sampled)`);
+  }
+  if (r.case !== 'real' && r.case !== 'flat') {
     const mid = r.engine === 'webcodecs' ? r.frames >> 1 : ids.indexOf(r.frames >> 1);
     const errs = patchErrors(file, r.width, r.height, Math.max(0, mid));
     add('colours (ffmpeg)', Math.max(...errs) <= COLOR_TOL, `max err ${Math.max(...errs)} [${errs.join(' ')}]`);
   }
   if (r.playback) {
     const p = r.playback;
-    add('plays in browser', p.ok, p.error || `dur ${p.duration} s, seeks ${p.seeks.map(x => x.want + '→' + x.got).join(' ')}`);
+    const miss = (p.seeks || []).filter(x => x.got !== x.want);
+    const seeks = !p.seeks ? '' : p.seeks.length > 3
+      ? `${p.seeks.length} seeks (every frame), ${miss.length ? 'wrong: ' + miss.slice(0, 8).map(x => x.want + '→' + x.got).join(' ') : 'all exact'}`
+      : `seeks ${p.seeks.map(x => x.want + '→' + x.got).join(' ')}`;
+    add('plays in browser', p.ok, p.error || `dur ${p.duration} s, ${seeks}`);
     if (p.patchErr) add('colours (browser)', Math.max(...p.patchErr) <= COLOR_TOL, `max err ${Math.max(...p.patchErr)} [${p.patchErr.join(' ')}]`);
   }
   // Middle frame as PNG, to look at.
@@ -284,7 +358,10 @@ for (const run of RUNS) {
   for (const r of done.results) {
     let ok = r.ok, detail = '';
     const cannot = !probe.webcodecs && !probe.recorder;
-    if (['odd', 'drawerr', 'abort'].includes(r.case)) {
+    if (r.case === 'sizes') {
+      // every size: a file, or 'unsupported' (never 'encode'); nothing slow to say no
+      detail = r.rows.map(x => `${x.size} ${x.ok && !x.code ? `${x.engine} ${x.codec}` : x.code} ${x.ms}ms`).join(', ');
+    } else if (['odd', 'drawerr', 'abort', 'progthrow'].includes(r.case)) {
       detail = r.case === 'abort' ? `code ${r.code}, stopped ${r.latencyMs} ms after abort()` : `code ${r.code}: ${r.message}`;
       if (cannot && r.case !== 'odd') { ok = r.code === 'unsupported'; detail = 'no encoder: ' + detail; }
     } else if (cannot) {

@@ -1,0 +1,118 @@
+// End-to-end: the Film dialog's Background picker, through the real UI.
+//   node tests/film.dialog.e2e.mjs [--runs 3]
+// Checks: 8 swatches in a radiogroup with names and a caption, Nero marble by default; the dialog's
+// first preview frame and the desk's full bake are timed (median of --runs page loads); picking a
+// swatch (click and arrow keys) switches the live preview at once, persists prefs.film.desk and
+// survives closing and reopening; the Flat style keeps the picker and shows the desk too.
+// Writes shots/dialog_desk_<id>.png (the dialog) for a look. Requires the dev server (port 8830).
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const PW = 'C:/Users/oxman/open-design/node_modules/.pnpm/playwright-core@1.60.0/node_modules/playwright-core';
+const pw = require(PW);
+const args = process.argv.slice(2);
+const opt = (k, d) => { const i = args.indexOf('--' + k); return i >= 0 ? args[i + 1] : d; };
+const runs = +opt('runs', 3);
+
+let failures = 0;
+const check = (ok, msg) => { console.log(`${ok ? 'ok  ' : 'FAIL'}  ${msg}`); if (!ok) failures++; };
+const median = a => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
+
+const browser = await pw.chromium.launch({ headless: true, args: ['--use-angle=d3d11', '--enable-gpu', '--ignore-gpu-blocklist'] });
+const logs = [];
+async function boot() {
+  const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+  page.on('console', m => { if (['error'].includes(m.type())) logs.push(`[${m.type()}] ${m.text()}`); });
+  page.on('pageerror', e => logs.push('[pageerror] ' + e.message));
+  await page.goto('http://localhost:8830/?v=' + Date.now());
+  await page.waitForFunction(() => window.SP && window.SP.geom && !window.SP.play.playing, null, { timeout: 60000 });
+  return page;
+}
+// until the preview shows its first frame, then until the desk is fully baked
+async function openTimed(page) {
+  const t0 = Date.now();
+  await page.evaluate(() => { window.__filmPreview = null; SP.openFilm(); });
+  await page.waitForFunction(() => window.__filmPreview, null, { timeout: 30000, polling: 16 });
+  const first = await page.evaluate(() => window.__filmPreview.firstFrameMs);
+  await page.waitForFunction(() => window.__filmPreview.stage() === 'full', null, { timeout: 30000, polling: 16 });
+  return { first, full: Date.now() - t0 };
+}
+
+// 1. cold opens (fresh page each time: the scene program and the desk are made from scratch)
+const cold = [];
+for (let k = 0; k < runs; k++) {
+  const page = await boot();
+  await page.evaluate(() => { SP.prefs.film.desk = 'nero'; SP.prefs.film.style = 'cinematic'; SP.prefs.film.format = 'square'; });
+  cold.push(await openTimed(page));
+  if (k < runs - 1) await page.close();
+  else {
+    // 2. the picker
+    const info = await page.evaluate(() => {
+      const g = document.querySelector('#filmDialog [data-film="desk"]');
+      const b = [...g.querySelectorAll('[role="radio"]')];
+      return { role: g.getAttribute('role'), label: !!g.getAttribute('aria-labelledby'), n: b.length,
+        names: b.map(x => x.getAttribute('aria-label')), checked: b.filter(x => x.getAttribute('aria-checked') === 'true').map(x => x.dataset.v),
+        tabbable: b.filter(x => x.tabIndex === 0).map(x => x.dataset.v), cap: document.getElementById('filmDeskCap').textContent,
+        imgs: b.every(x => x.querySelector('img')?.complete && x.querySelector('img').naturalWidth > 0) };
+    });
+    check(info.role === 'radiogroup' && info.label, 'the picker is a labelled radiogroup');
+    check(info.n === 8 && info.names.every(Boolean), `8 swatches with accessible names (${info.names.join(', ')})`);
+    check(info.checked.join() === 'nero' && info.tabbable.join() === 'nero', 'Nero marble is selected and is the one tab stop');
+    check(/Nero marble/.test(info.cap) && /veins/.test(info.cap), `caption: "${info.cap}"`);
+    check(info.imgs, 'every swatch image loaded');
+    await page.locator('#filmDialog').screenshot({ path: 'shots/dialog_desk_nero.png' });
+
+    // 3. click a swatch: the preview's scene switches at once (stand-in colour, then a quick
+    // low-resolution bake, then the full desk), without restarting the film
+    await page.waitForTimeout(1500);          // (a person takes a moment to choose)
+    const t0 = Date.now();
+    const trail = await page.evaluate(async () => {
+      document.querySelector('#filmDialog [data-film="desk"] [data-v="velvet"]').click();
+      const out = [], s0 = performance.now();
+      while (performance.now() - s0 < 3000) {
+        const st = window.__filmPreview.stage();
+        if (!out.length || out[out.length - 1].stage !== st) out.push({ ms: Math.round(performance.now() - s0), stage: st, desk: window.__filmPreview.desk() });
+        if (st === 'full') break;
+        await new Promise(r => requestAnimationFrame(r));
+      }
+      return out;
+    });
+    const switchMs = Date.now() - t0;
+    const st = await page.evaluate(() => ({ desk: SP.prefs.film.desk, cap: document.getElementById('filmDeskCap').textContent,
+      checked: document.querySelector('#filmDialog [data-film="desk"] [aria-checked="true"]').dataset.v }));
+    check(st.desk === 'velvet' && st.checked === 'velvet' && /Emerald velvet/.test(st.cap), `click selects velvet (${st.cap})`);
+    check(trail[0]?.desk === 'velvet' && trail[0].ms < 20, `the preview switches at once (${trail.map(x => `${x.ms} ms ${x.stage}`).join(' -> ')})`);
+    check(trail[trail.length - 1]?.stage === 'full', `velvet fully baked within ${switchMs} ms`);
+    await page.waitForTimeout(300);
+    await page.locator('#filmDialog').screenshot({ path: 'shots/dialog_desk_velvet.png' });
+
+    // 4. keyboard: arrows move the selection (roving tab stop)
+    await page.focus('#filmDialog [data-film="desk"] [data-v="velvet"]');
+    await page.keyboard.press('ArrowRight');
+    const kb = await page.evaluate(() => ({ desk: SP.prefs.film.desk, focus: document.activeElement?.dataset.v }));
+    check(kb.desk === 'leather' && kb.focus === 'leather', `ArrowRight moves to leather (${kb.desk}, focus ${kb.focus})`);
+    await page.keyboard.press('ArrowLeft');
+
+    // 5. persists: close, reopen (warm: the program and the desk are still in the context)
+    await page.click('#filmClose');
+    const persisted = await page.evaluate(() => JSON.parse(localStorage.getItem(Object.keys(localStorage).find(k => /spiral/i.test(k)) || '{}'))?.film?.desk ?? SP.prefs.film.desk);
+    const warm = await openTimed(page);
+    const re = await page.evaluate(() => document.querySelector('#filmDialog [data-film="desk"] [aria-checked="true"]').dataset.v);
+    check(re === 'velvet', `reopened on velvet (stored: ${persisted})`);
+    console.log(`      warm reopen: first frame ${warm.first} ms, full desk ${warm.full} ms`);
+
+    // 6. flat keeps the desk
+    await page.click('#filmDialog [data-film="style"] [data-v="flat"]');
+    await page.waitForFunction(() => window.__filmPreview && window.__filmPreview.stage() === 'full', null, { timeout: 30000 });
+    await page.waitForTimeout(400);
+    const flat = await page.evaluate(() => ({ disabled: [...document.querySelectorAll('#filmDialog [data-film="desk"] button')].some(b => b.disabled) }));
+    check(!flat.disabled, 'the picker stays enabled for Flat');
+    await page.locator('#filmDialog').screenshot({ path: 'shots/dialog_desk_flat.png' });
+    await page.evaluate(() => { SP.prefs.film.style = 'cinematic'; SP.prefs.film.desk = 'nero'; SP.persist?.(); });
+    await page.close();
+  }
+}
+console.log(`cold open (median of ${runs}): first frame ${median(cold.map(c => c.first))} ms, desk fully baked ${median(cold.map(c => c.full))} ms  [${cold.map(c => `${c.first}/${c.full}`).join(', ')}]`);
+if (logs.length) { console.log(logs.slice(0, 20).join('\n')); failures += logs.filter(l => l.includes('pageerror')).length; }
+await browser.close();
+if (failures) { console.log(`\n${failures} failing`); process.exit(1); }
+console.log('\nall passed');

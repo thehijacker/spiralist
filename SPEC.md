@@ -13,7 +13,12 @@ Headless driver: `node tests/shoot.mjs "/dev/lab.html?sheet=matrix;size=300" [--
 via ANGLE D3D11). Firefox/WebKit builds come from playwright-core 1.60 (path inside tests/shoot.mjs).
 Waits for `window.__done` and prints it plus console errors. Then `Read` the PNG/JPEG to look at it.
 
-Unit tests: `node tests/geometry.test.mjs` (engine). Add your own `tests/<module>.test.mjs`.
+Unit tests: `node tests/geometry.test.mjs` (engine), `tests/brush.test.mjs`, `tests/papers.test.mjs`,
+`tests/scene.test.mjs`, `tests/export.test.mjs`. Browser tests: `tests/encoder.test.mjs`,
+`tests/intake.e2e.mjs`, `tests/film.e2e.mjs`, `tests/film.dialog.e2e.mjs`, `tests/app-shot.mjs`.
+Labs: `dev/lab.html` (physics sheets; `consistency` also compares fine texture, `wetset`),
+`dev/export.html` (`t=strips|seams|transp`), `dev/dry.html` (dry media), `dev/wetbench.html`
+(wet media timing and compile cost), `dev/signature.html`, `dev/deskbake.html`, `dev/desks.html`.
 
 ## Ground rules for every contributor
 - Edit ONLY the files your task owns. If you need a change elsewhere, describe it in your report.
@@ -50,15 +55,69 @@ Unit tests: `node tests/geometry.test.mjs` (engine). Add your own `tests/<module
   One polyline, consecutive points always joined. Pacing: `pacingTable(geom, 'natural'|'steady'|'rings')`,
   `indexAt(geom, f, pacing)`, `progressAt(geom, fi, pacing)`, `headAt(geom, fi) -> {x,y,w,tone,turn}`.
   `previewStroke({technique})` builds a 2.5-turn demo fragment for brush chips.
-- `js/renderer.js` — `new Renderer(canvas, {onLost, onRestored})`:
+- `js/renderer.js` — `new Renderer(canvas, {onLost, onRestored, warmup, block, keepCanvas})`:
   `setSize(w,h)` (target px) · `setPaperSize(W,H)` + `setOrigin(x,y)` (strip rendering of a bigger
   sheet) · `setLayout({cx,cy,r})` · `setPaper(paperDef, seed)` · `setStyle({brush, ink, cover, photoColor})`
-  · `setGeometry(geom)` · `setTransparent(bool)` (straight-alpha ink only) · `render(upToPointIndex=Infinity)`
-  (incremental; scrubbing back redraws) · `renderToTexture(upTo) -> {tex, w, h}` (the same image into a
-  mipmapped texture of this context, for the film camera) · `renderBlank()` · `destroy()` · `maxSize` · `canvas`.
+  · `setGeometry(geom, {pacing})` · `setPacing('natural'|'steady'|'rings')` · `setTransparent(bool)`
+  (straight-alpha ink only) · `setLight({azimuth, elevation, intensity, warmth, view, eye})` ·
+  `setTime(seconds|null)` · `render(upTo=Infinity, {settle})` (incremental; scrubbing back redraws) ·
+  `renderToTexture(upTo, {settle, rect, size}) -> {tex, w, h, rect}` (the same image into a mipmapped
+  texture of this context, for the film camera; `rect` = a sub-region at higher density, see below) ·
+  `releaseRect()` · `renderBlank()` · `pending(brush?, paper?, start = true)` · `freeSim()` ·
+  `setSimClock({at, v, mix} | null)` ·
+  `destroy()` · `maxSize` · `canvas`.
   Output canvas has `preserveDrawingBuffer: true`, so `drawImage(renderer.canvas, …)` and `toBlob` work any time.
 - `js/shaders.js` — assembles programs from `js/brushes.js` (BRUSH_GLSL) and `js/papers.js`
-  (PAPER_TILE_GLSL, PAPER_SURFACE_GLSL).
+  (PAPER_TILE_GLSL, PAPER_SURFACE_GLSL, PAPER_PHYS_GLSL). `js/wetsim.js` — the wet-media simulation.
+
+### Renderer: the physics core
+- **Passes.** Stroke pass: one instanced capsule per segment, MAX-blended into two targets (MRT):
+  pigment (RGBA8) and surface (RGBA16F: groove, raised, sheen, pen time). Wet media only: the same
+  stroke program draws the liquid each segment lays down into an injection map on the wet grid, and
+  `wetsim.js` steps it. Glow (neon): quarter-res separable blur. Composite: lit paper + medium relief +
+  pigment + simulated wet layer + specular per material → canvas or texture.
+- **Exactness.** Every pass takes the paper position from `gl_FragCoord` (exact pixel centres, whole
+  origins) and every neighbourhood read is a hand-made bilinear of exact texel fetches, so a strip of an
+  export and a full pass are identical to the bit (`/dev/export.html?t=strips` requires max diff 0).
+  Brushes must keep every output inside their quad: the stroke pass cuts anything past
+  `hw * spread + 1 px` (the quad's rasterised edge snaps differently per target size).
+- **Light.** Default = the window light every still was tuned under (upper left, 40°); `setLight()`
+  restores it. `view` = direction toward the camera; `eye` = camera position in sheet widths
+  (x, y from the top-left corner, z above the sheet) makes the view vector per pixel, so glints are
+  local. `setTime` drives neon flicker. Light and time change only the composite (cheap per frame).
+- **Wet media** (`brush.wetness > 0`): a sheet-space grid of `WET_GRID` = 1024 cells across the sheet
+  (~0.2 mm per cell) whatever the output size, `STEPS_DRAW` = 240 steps spread over the drawing by
+  pacing time, then `STEPS_SETTLE` = 60 drying steps. `render(upTo)` shows the state at that pen
+  time (a pure function of progress, incremental forward); `settle` 0..1 dries it after the drawing
+  (default 1 for `upTo = Infinity`, so a still is dry; the film ramps it over the hold). `setSimClock` runs the steps
+  on a film's own time (half film time, half pen time), so the macro opening's fresh ink soaks in and
+  bleeds on screen; it stays a pure function of progress. State is
+  RGBA32F where float targets can be filtered, else RGBA16F, else RGBA8 (scaled); if even that fails
+  the medium renders dry. The film should call `setPacing` with the pacing it plays.
+- **Rect view** (`renderToTexture(upTo, {rect: [x0,y0,x1,y1], size})`, sheet fractions): renders that
+  part of the same sheet as if the sheet were `size / (x1-x0)` px wide (grain, grit, granulation and
+  the shared wet state at that density), into its own targets that stay alive between calls (redrawn
+  from scratch when the rect moves, incrementally while it holds). The texture has a margin (glow,
+  relief) and an origin snapped to 4 texels: map it with the RETURNED `rect`. It matches a full render
+  at that density to the bit; `releaseRect()` frees it.
+- **Shader programs** are specialised per medium (stroke: the brush id; composite: material, wet
+  layer, and the chalkboard / blueprint extras) and made on first use. Where the browser compiles in
+  parallel (`KHR_parallel_shader_compile`) nothing on the page waits for a compile:
+  `pending(brush, paper)` starts whatever that style needs and answers at once; a renderer made
+  with `block: false` (the app's stage, the chips, the film stage) returns `'pending'` from
+  `render()` / `renderBlank()` (and null from `renderToTexture()`) and draws nothing until it is
+  false, so the caller keeps its last image and tries again next frame. `block` defaults to true
+  (exports, tests, labs: compile on the spot). `warmup: true` (the app's stage only) compiles the
+  other media's programs in the background, one every 80 ms, after the first render. Status
+  queries that wait for the GPU (`checkFramebufferStatus`, a WebGL canvas resize, `isProgram`) are
+  asked once per layout or avoided: they wait for every queued compile and froze tool switches.
+  `keepCanvas: true` (the chips) never shrinks the canvas; each image is its bottom-left corner.
+- **GPU memory.** The wet grid (~70 MB at 1024 cells, float32) is allocated for the first wet
+  draw and freed again by `freeSim()`: automatically when a dry medium is set, by the chips after
+  8 s idle, and by the film stage between films (which also drops its sheet-sized targets).
+- **Budget** (RTX 4070, 128k segments): still from scratch ~2 ms dry / ~35-45 ms wet at 1100 px;
+  incremental film frame ~2 ms at 2048; rect frame ~1.5-2.5 ms at 1024; one wet step ~0.07 ms.
+  Measured by `/dev/lab.html?sheet=timing`.
 - `js/materials.js` — re-exports BRUSHES/PAPERS, `hexToRgb`, `luminance`, `contrastRatio`,
   `inkMode(brush, inkHex, paper, colorFromPhoto) -> {cover, flip, lowContrast}` (the ONLY place
   tone polarity is decided), `LOOKS`, `lookById`.
@@ -82,14 +141,27 @@ r.setStyle(state); r.setGeometry(state.geom); r.render(Infinity);`
 ## Modules built in parallel
 
 ### js/brushes.js — brush tuner
-Owns `BRUSHES` data (inks as `[hex, name]`, `spread`, `lightInk`, `glow: {amount, tight, wide}`,
-`forceCover`, `prefersDark`) and `BRUSH_GLSL` (`brushDeposit(int brush, Stroke st, inout vec3 ink)`).
-Shader ids 0..10 are fixed (renderer passes `brush.shader`).
+Owns `BRUSHES` data (inks as `[hex, name]`, `spread` (<= 3), `lightInk`, `glow: {amount, tight, wide}`,
+`forceCover`, `prefersDark`, `material` ('ink' | 'graphite' | 'wax' | 'chalk' | 'metal' | 'light' |
+'oil'), `wetness`, `wet: {mobile, dye, gran, dry, flow, pool, poolAt, layer, sharp, wick, retard,
+stick, tide, sheen}`) and
+`BRUSH_GLSL` (`brushDeposit(int brush, Stroke st, inout vec3 ink, out Surface sf)`; the Stroke and
+Surface fields are documented above BRUSH_GLSL). Shader ids 0..11 are fixed (renderer passes
+`brush.shader`; 11 = watercolour). `brushWet(brush)` returns the wet parameters with defaults.
+The dry media's GLSL (pencil, charcoal, crayon, chalk, ballpoint, neon, gold) lives in `dryGLSL()`
+at the end of the file; `brushDeposit` calls it. Wet media state (js/wetsim.js): A (water,
+suspended, deposited, fibre moisture), B (wet extent, edge pull, film age, D = colour in the
+fibres' water), C (colourant caught in the fibres: bleeds and stains, drawn without the surface
+water's hard edge), inj (latest pass: water, pigment, coverage, pen time) and inj2 (earliest pass,
+so a later pass over earlier ink adds to it: `wet.layer`). Pooling needs dwell above
+`1 + wet.poolAt`, scaled by a random hesitation per turn. Checked by `tests/brush.test.mjs`.
 
 ### js/papers.js — paper tuner
 Owns `PAPERS` data and `PAPER_TILE_GLSL` (`vec4 paperTile(vec2 uv)`, must tile seamlessly) and
 `PAPER_SURFACE_GLSL` (`vec3 paperSurface(vec2 P, out float shade)`). Paper ids are fixed:
-sketch, cream, coldpress, kraft, black, chalkboard, blueprint.
+sketch, cream, coldpress, kraft, black, chalkboard, blueprint. Physical properties for wet media
+(`absorb`, `sizing`, `fibre`, `capacity`, `grainDeg`; `paperPhysics(paper)` fills defaults) and
+`PAPER_PHYS_GLSL` (`vec4 paperPhys(vec2 P)`: height, conductance, fibre orientation on the wet grid).
 
 ### js/samples.js — sample images
 ```js
@@ -111,6 +183,12 @@ export function drawToolMotion(ctx, kind, points, size, opts)  // motion blur: p
 ```
 Handsome, recognisable at 60–400 px length, crisp at any DPR, no external images.
 
+### js/share.js — X and credits
+`shareToX(getBlob, {filename, kind, download, canShare, mime}) -> 'shared' | 'cancelled' | 'intent' |
+'blocked' | 'saved'` never navigates the page (the user's film would be lost): phones hand the file
+to the share sheet; desktops open X's composer inside the click and save the file to attach;
+'blocked' / 'saved' mean no tab could open, so the caller offers `openXIntent(kind)` from a fresh tap.
+
 ### js/encoder.js — video encoding
 ```js
 export async function probeVideo({ width, height, fps }) ->
@@ -122,8 +200,13 @@ export async function encodeVideo({
   signal,                                   // AbortSignal
   onProgress,                               // (done, total, previewCanvas) => void
   engine = 'auto',                          // 'auto' | 'webcodecs' | 'recorder'
-}) -> { blob, mimeType, ext, engine, codec, width, height, fps, frames, bytes }
+  keyFrames,                                // frame indices forced to keyframes (the recorder ignores it)
+}) -> { blob, mimeType, ext, engine, codec, width, height, fps, frames, bytes, restarts, dropped, … }
 ```
+`onProgress(0, total, null)` marks a restart (hardware -> software, or -> MediaRecorder);
+`result.restarts` counts them. B-frame streams are written with an edit list (as ffmpeg / x264),
+access-unit delimiters are stripped, and the track timescale is fps x 2^n >= 10000, so every frame
+seeks exactly in Chromium, Firefox and ffmpeg. `avcLevel(w, h, fps, bitrate)`: 1080x1920 @ 60 = 4.2.
 WebCodecs H.264 (avc1.640028 → 4D0028 → 42E028 via isConfigSupported) + vendored mp4-muxer
 (`fastStart: 'in-memory'`), keyframe every 2 s, backpressure on `encodeQueueSize`, `frame.close()`,
 no requestAnimationFrame dependency. Fallback: MediaRecorder real time (mp4 preferred, else webm),
@@ -149,6 +232,29 @@ export async function copyPNG(blobPromise) -> boolean  // ClipboardItem created 
 export function fileName(parts: string[], ext) -> 'spiralist-…'
 ```
 
+### js/film.js, js/scene.js, js/desks.js, js/signature.js — the film
+```js
+drawSeconds(length, reveal = false, style = 'cinematic', sign = 0)   // the drawing's share of a film
+signSeconds(text)                                  // 1.0-1.4 s of writing, 0 when unsigned
+new FilmComposer({ W, H, format, length, fps, style, showTool, polaroid, reveal, pacing, state,
+  drawPhoto, tools, sceneLib, desk, renderer /* shared, not destroyed */, live, signature, macro })
+  .prepare() · .ready() /* nothing would wait for a compile */ · .draw(i, ctx) · .encodeHints() · .destroy()
+warmFilm(desk)                                     // start the film's context, scene compile and desk bake early
+```
+The dialog's preview and its encodes share one renderer (`block: false`: an encode waits for its
+programs before the first frame). A cinematic film opens on a 5.5x macro of the nib
+(`renderToTexture` with a rect; `scene.MACRO`), passes the camera's eye with the light, and ends on
+a full-sheet shot over the chosen desk. `scene.js`: `cameraBasis`, `project`, `unproject`,
+`planPace`, `planCamera({…, sign})`, `shotIntent({…, macro})`, `FilmScene(gl, {dark, seed, glow,
+desk, wait}).render({sheet, basis, focus, wipe, light, time, sun, macro})`, `loadDesk`, `warmDesks`,
+`sceneReady`, `deskStatus`, `deskBakeSize`. `desks.js`: `DESKS` (nero, calacatta, travertine,
+limewash, velvet, leather, sunlit, onyx), `DeskBake`, `bakeDesk`. `signature.js`: `cleanSignature`,
+`traceSignature`, `timeSignature`, `placeSignature` (the pen signs the corner in the same medium,
+appended to the geometry with zero-width lifts, so FRAG_STROKE must deposit nothing where the true
+width is 0).
+
 ## App (lead): index.html, css/app.css, js/app.js, js/film.js (timeline + frame composer),
-dialogs. Visual language: Instrument Serif + Geist; tokens --desk, --chrome, --surface, --border,
+dialogs. The stage renderer never blocks on a compile (a spinner shows if one takes a moment);
+`setPacing(prefs.pacing)` follows the transport; wet ink dries on screen over 1.6 s when playback
+ends; the transport previews the film's exact drawing time (style and signature included). Visual language: Instrument Serif + Geist; tokens --desk, --chrome, --surface, --border,
 --text, --text-muted, --accent (#C43D16 light / #FF7A4D dark); light + dark themes.

@@ -4,6 +4,12 @@
 //   /dev/enc.html?cases=tall,square,abort,odd;engine=auto;tag=cr;secs=3;play=1
 //   cases: tall 1080x1920 · square 1080x1080 · wide 1920x1080 · speed (15 s tall, synthetic)
 //          real (15 s tall, WebGL spiral renderer) · abort · odd · drawerr · hidden (fake tab hide)
+//          hiddenstart (tab hidden when the export starts, shown after 1 s)
+//          hidefall (auto, tab hidden, H.264 encoder dies -> recorder fallback must wait and finish)
+//          tall60 (1080x1920 @ 60 fps: needs level 4.2) · odd75 (75 frames @ 25: odd count)
+//          keys (keyFrames at odd indices, like the film's encodeHints) · flat (moving dot on
+//          flat paper, for encoder trails) · progthrow (onProgress throws) · sizes (edge sizes: ok or
+//          'unsupported', never 'encode')
 // Every frame carries a 16-bit barcode of its index in the top band, so a decoder can prove that
 // decoded frame n is drawn frame n. Sets window.__done = { ok, probe, results }.
 import { encodeVideo, probeVideo, defaultBitrate } from '../js/encoder.js';
@@ -12,10 +18,13 @@ const q = new URLSearchParams(location.search);
 const engine = q.get('engine') || 'auto';
 const tag = q.get('tag') || 'x';
 const secs = +(q.get('secs') || 3);
-const fps = +(q.get('fps') || 30);
+const FPS_Q = +(q.get('fps') || 30);
+let fps = FPS_Q;   // per case (odd75 runs at 25)
 const doPlay = q.get('play') !== '0';
-// types=webm forces the WebM recorder path (what Chrome < 126 and Firefox produce)
-const recorderTypes = q.get('types') === 'webm' ? ['video/webm;codecs=vp9', 'video/webm'] : undefined;
+// types=webm forces the WebM recorder path (what Chrome < 126 and Firefox produce); vp8 / vp9
+// force that codec
+const recorderTypes = { webm: ['video/webm;codecs=vp9', 'video/webm'], vp8: ['video/webm;codecs=vp8'],
+  vp9: ['video/webm;codecs=vp9'] }[q.get('types')];
 const logEl = document.getElementById('log'), bar = document.getElementById('bar');
 const log = (...a) => { logEl.textContent += a.join(' ') + '\n'; };
 
@@ -90,6 +99,29 @@ function drawSynthetic(i, ctx, c, total) {
   PATCHES.forEach((hex, k) => { ctx.fillStyle = hex; ctx.fillRect(gap + k * (pw + gap), py, pw, pw); });
   // progress bar
   ctx.fillStyle = '#c43d16'; ctx.fillRect(0, H - 1.2 * u, W * (i + 1) / total, 1.2 * u);
+}
+
+// Flat paper, one dot on a circle (formula shared with tests/encoder.test.mjs): what is left
+// behind the dot is encoder trail.
+export function flatDot(i, W, H) {
+  return [W / 2 + Math.cos(i / 15) * W * 0.3, H / 2 + Math.sin(i / 15) * W * 0.3, 5 * W / 100];
+}
+function drawFlat(i, ctx, c) {
+  const W = c.width, H = c.height, [x, y, r] = flatDot(i, W, H);
+  ctx.fillStyle = '#f3ecdf'; ctx.fillRect(0, 0, W, H);
+  drawBarcode(ctx, W, i);
+  ctx.fillStyle = '#c43d16'; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+}
+
+// Fake page visibility (headless tabs are never really hidden). Returns set(hidden) and restore().
+function fakeVisibility(initial) {
+  let fake = initial;
+  Object.defineProperty(document, 'hidden', { configurable: true, get: () => fake });
+  Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => (fake ? 'hidden' : 'visible') });
+  return {
+    set: v => { fake = v; document.dispatchEvent(new Event('visibilitychange')); },
+    restore: () => { delete document.hidden; delete document.visibilityState; },
+  };
 }
 
 export function patchRects(W, H) {
@@ -178,7 +210,9 @@ const once = (el, ev, ms = 15000) => new Promise((res, rej) => {
 });
 
 // Decode the file in this browser's own <video>: duration, seekability, and exact frames.
-async function playback(blob, frames, leadS = 0, synthetic = true, tolerance = 0) {
+// every: seek to every frame, not just first / middle / last (players get the frames around
+// keyframes wrong when a keyframe's decode time is off; Chromium seeks by it).
+async function playback(blob, frames, leadS = 0, synthetic = true, tolerance = 0, every = false) {
   const v = document.createElement('video');
   v.muted = true; v.playsInline = true; v.preload = 'auto';
   const url = URL.createObjectURL(blob);
@@ -191,7 +225,7 @@ async function playback(blob, frames, leadS = 0, synthetic = true, tolerance = 0
     const c = document.createElement('canvas'); c.width = v.videoWidth; c.height = v.videoHeight;
     const g = c.getContext('2d', { willReadFrequently: true });
     out.seeks = [];
-    for (const k of [0, Math.floor(frames / 2), frames - 1]) {
+    for (const k of every ? [...Array(frames).keys()] : [0, Math.floor(frames / 2), frames - 1]) {
       v.currentTime = (k + 0.5) / fps + (k ? leadS : 0);
       // 'seeked' can fire before the frame is presented; wait for it where the API exists
       const shown = v.requestVideoFrameCallback ? new Promise(r => { v.requestVideoFrameCallback(() => r()); setTimeout(r, 500); }) : null;
@@ -234,10 +268,43 @@ function preview(canvas) {
 }
 
 // ------------------------------------------------------------------ cases
-const SIZES = { noraf: [1080, 1920], tall: [1080, 1920], square: [1080, 1080], wide: [1920, 1080], speed: [1080, 1920], real: [1080, 1920], hidden: [1080, 1080] };
+const SIZES = { noraf: [1080, 1920], tall: [1080, 1920], square: [1080, 1080], wide: [1920, 1080], speed: [1080, 1920], real: [1080, 1920],
+  hidden: [1080, 1080], hiddenstart: [1080, 1080], hidefall: [720, 720], odd75: [1080, 1080], keys: [1080, 1920], flat: [1080, 1920],
+  tall60: [1080, 1920] };
+// Per-case frame rate / count / extra encodeVideo options. keys: two forced keyframes at odd
+// indices (like the film's encodeHints), so every GOP is odd and a B-frame stream ends on a B.
+const SPECS = { odd75: { fps: 25, frames: 75 }, keys: { frames: 90, keyFrames: [45, 75] }, flat: { frames: 90 },
+  hiddenstart: { frames: 60 }, hidefall: { frames: 60 }, tall60: { fps: 60, frames: 120 } };
+// Cases whose playback check seeks to every frame (short, synthetic, frame-exact files).
+const SEEK_ALL = ['tall', 'odd75', 'keys', 'tall60'];
 
 async function runCase(name) {
+  fps = SPECS[name]?.fps || FPS_Q;
   const res = { case: name };
+  if (name === 'progthrow') {
+    // The caller's progress callback throws: a coded 'encode' error on every path, not a raw one.
+    try {
+      await encodeVideo({ width: 320, height: 240, frames: 20, engine,
+        drawFrame: (i, ctx, c) => drawSynthetic(i, ctx, c, 20),
+        onProgress: d => { if (d === 5) throw new TypeError('ui blew up'); } });
+      return { ...res, ok: false, error: 'progress error was swallowed' };
+    } catch (e) { return { ...res, ok: e.code === 'encode' && /frame 5/.test(e.message) && e.cause instanceof TypeError, code: e.code, message: e.message }; }
+  }
+  if (name === 'sizes') {
+    // Edge sizes: a file, or a clean 'unsupported' (quickly), never 'encode'.
+    const rows = [];
+    for (const [w, h] of [[2, 2], [16, 16], [64, 64], [3840, 2160], [4096, 4096], [8192, 8192]]) {
+      const t0 = performance.now();
+      const probe = await probeVideo({ width: w, height: h, fps });
+      try {
+        const r = await encodeVideo({ width: w, height: h, frames: 6, engine, drawFrame: (i, ctx, c) => drawSynthetic(i, ctx, c, 6) });
+        rows.push({ size: `${w}x${h}`, ok: true, engine: r.engine, codec: r.codec, bytes: r.bytes, probe: !!(probe.webcodecs || probe.recorder), ms: Math.round(performance.now() - t0) });
+      } catch (e) {
+        rows.push({ size: `${w}x${h}`, ok: e.code === 'unsupported', code: e.code, message: e.message, probe: !!(probe.webcodecs || probe.recorder), ms: Math.round(performance.now() - t0) });
+      }
+    }
+    return { ...res, ok: rows.every(r => r.ok), rows };
+  }
   if (name === 'odd') {
     try {
       await encodeVideo({ width: 1081, height: 1920, frames: 3, drawFrame: () => {}, engine });
@@ -268,8 +335,10 @@ async function runCase(name) {
   }
 
   const [W, H] = SIZES[name] || SIZES.tall;
-  const total = name === 'speed' || name === 'real' ? 15 * fps : Math.round(secs * fps);
+  const spec = SPECS[name] || {};
+  const total = spec.frames || (name === 'speed' || name === 'real' ? 15 * fps : Math.round(secs * fps));
   let draw = (i, ctx, c) => drawSynthetic(i, ctx, c, total);
+  if (name === 'flat') draw = drawFlat;
   if (name === 'real') {
     const tb = performance.now();
     draw = await spiralDrawer(W, H, total);
@@ -282,28 +351,52 @@ async function runCase(name) {
     window.requestAnimationFrame = () => 0;
     res.restore = () => { window.requestAnimationFrame = orig; };
   }
+  let vis = null, restoreEncode = null;
   if (name === 'hidden') {
     // Fake a tab switch 1.0 s .. 2.5 s into the recording (headless tabs are never really hidden).
-    let fake = false;
-    Object.defineProperty(document, 'hidden', { configurable: true, get: () => fake });
-    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => (fake ? 'hidden' : 'visible') });
-    const flip = v => { fake = v; document.dispatchEvent(new Event('visibilitychange')); };
-    setTimeout(() => flip(true), 1000); setTimeout(() => flip(false), 2500);
+    vis = fakeVisibility(false);
+    setTimeout(() => vis.set(true), 1000); setTimeout(() => vis.set(false), 2500);
+  }
+  if (name === 'hiddenstart' || name === 'hidefall') {
+    // The export starts in a hidden tab; the tab is shown again after 1 s.
+    vis = fakeVisibility(true);
+    setTimeout(() => vis.set(false), 1000);
+    res.shownAtMs = 1000;
+  }
+  if (name === 'hidefall' && typeof VideoEncoder !== 'undefined') {
+    // Every H.264 encoder dies after 12 frames (a GPU reset in a background tab): auto must fall
+    // back to the recorder, which must wait for the tab and then finish.
+    const orig = VideoEncoder.prototype.encode;
+    let calls = 0;
+    VideoEncoder.prototype.encode = function (f, o) {
+      if (++calls > 12) throw new DOMException('injected encoder failure', 'EncodingError');
+      return orig.call(this, f, o);
+    };
+    restoreEncode = () => { VideoEncoder.prototype.encode = orig; };
   }
   const drawTimes = [];
   const timedDraw = async (i, ctx, c) => { const t = performance.now(); await draw(i, ctx, c); drawTimes.push(performance.now() - t); };
-  let lastCanvas = null, progressCalls = 0, lastDone = 0, monotonic = true;
+  // Progress counts up; a restart (software retry, recorder fallback) reports 0 and counts again.
+  let lastCanvas = null, progressCalls = 0, lastDone = 0, monotonic = true, restarts = 0;
   const ui = watchUI();
   const t0 = performance.now();
   let out;
   try {
     out = await encodeVideo({ width: W, height: H, fps, frames: total, engine, drawFrame: timedDraw, recorderTypes,
-      onProgress: (done, tot, canvas) => { progressCalls++; if (done < lastDone || tot !== total) monotonic = false; lastDone = done; lastCanvas = canvas; bar.style.width = (100 * done / tot) + '%'; } });
+      ...(spec.keyFrames ? { keyFrames: spec.keyFrames } : {}),
+      onProgress: (done, tot, canvas) => {
+        progressCalls++;
+        if (done === 0 && !canvas) restarts++;
+        else if (done < lastDone || !canvas) monotonic = false;
+        if (tot !== total) monotonic = false;
+        lastDone = done; lastCanvas = canvas || lastCanvas; bar.style.width = (100 * done / tot) + '%';
+      } });
   } catch (e) {
     ui();
     return { ...res, ok: false, code: e.code, error: String(e.message || e), cause: e.cause ? String(e.cause.message || e.cause) : undefined };
   } finally {
-    if (name === 'hidden') { delete document.hidden; delete document.visibilityState; }
+    vis?.restore();
+    restoreEncode?.();
     if (res.restore) { res.restore(); delete res.restore; }
   }
   const ms = performance.now() - t0;
@@ -313,19 +406,24 @@ async function runCase(name) {
   const { blob, ...meta } = out;
   Object.assign(res, meta, uiStats, {
     ok: true, ms: Math.round(ms), encodeFps: +(total / (ms / 1000)).toFixed(1), realtimeX: +((total / fps) / (ms / 1000)).toFixed(2),
-    drawMedianMs: +(drawTimes[drawTimes.length >> 1] || 0).toFixed(2), progressCalls, progressMonotonic: monotonic, lastDone,
-    defaultBitrate: defaultBitrate(W, H, fps), file, blobType: blob.type,
+    drawMedianMs: +(drawTimes[drawTimes.length >> 1] || 0).toFixed(2), progressCalls, lastDone,
+    // a 0 only for each restart the encoder reports (hardware -> software -> recorder)
+    progressMonotonic: monotonic && restarts === out.restarts, progressRestarts: restarts,
+    defaultBitrate: defaultBitrate(W, H, fps), file, blobType: blob.type, keyFrames: spec.keyFrames,
   });
   if (lastCanvas) preview(lastCanvas);
-  if (doPlay) res.playback = await playback(blob, total, (out.leadInMs || 0) / 1000, name !== 'real', name === 'hidden' ? 3 : 0);
+  if (doPlay) {
+    res.playback = await playback(blob, total, (out.leadInMs || 0) / 1000, name !== 'real' && name !== 'flat',
+      name === 'hidden' ? 3 : 0, out.engine === 'webcodecs' && SEEK_ALL.includes(name));
+  }
   return res;
 }
 
 async function run() {
-  const known = [...Object.keys(SIZES), 'odd', 'drawerr', 'abort'];
+  const known = [...Object.keys(SIZES), 'odd', 'drawerr', 'abort', 'progthrow', 'sizes'];
   const cases = (q.get('cases') || 'tall,square').split(',').filter(c => known.includes(c));
   const probe = {};
-  for (const [W, H] of [[1080, 1920], [1080, 1080], [1920, 1080]]) probe[`${W}x${H}`] = await probeVideo({ width: W, height: H, fps });
+  for (const [W, H] of [[1080, 1920], [1080, 1080], [1920, 1080]]) probe[`${W}x${H}`] = await probeVideo({ width: W, height: H, fps: FPS_Q });
   log('probe', JSON.stringify(probe));
   const results = [];
   for (const c of cases) {

@@ -371,7 +371,9 @@ export function printedLength(geom, diameterMm = 180) {
  * A short synthetic spiral fragment (2.5 turns, thin-to-thick ramp) for brush previews.
  * Returned in the same format as buildSpiral, filling the unit circle.
  */
-export function previewStroke({ turns = 2.5, technique = 'thickness', ringsVisible = 5 } = {}) {
+// pauses: fractions along the fragment where the pen stops for a moment (dwell rises there, so a
+// wet medium pools and 'natural' pacing slows), for the wet tools' chips
+export function previewStroke({ turns = 2.5, technique = 'thickness', ringsVisible = 5, pauses = [] } = {}) {
   const d = 1 / ringsVisible, b = d / (2 * Math.PI);
   const pts = [];
   const theta0 = (ringsVisible - turns) * 2 * Math.PI;
@@ -386,7 +388,9 @@ export function previewStroke({ turns = 2.5, technique = 'thickness', ringsVisib
     const x = rr * Math.cos(th), y = rr * Math.sin(th);
     if (pts.length) s += Math.hypot(x - px, y - py);
     const w = technique === 'wave' ? d * 0.18 : d * (0.08 + 0.8 * D);
-    pts.push(x, y, w, s, D, th / (2 * Math.PI), 1);
+    let dwell = 1;
+    for (const pu of pauses) dwell = Math.max(dwell, 1 + 0.9 * Math.exp(-(((u - pu) / 0.01) ** 2)));
+    pts.push(x, y, w, s, D, th / (2 * Math.PI), dwell);
     px = x; py = y;
   }
   const data = new Float32Array(pts);

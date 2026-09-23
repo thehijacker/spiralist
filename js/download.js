@@ -2,7 +2,7 @@
 // filled outline, plotter fill), plus copy-to-clipboard. Choices are remembered; Ctrl+S reuses them.
 
 import { bindSeg, toast, announce } from './ui.js';
-import { shareToX } from './share.js';
+import { shareToX, openXIntent } from './share.js';
 
 export function createDownloadDialog(app) {
   const $ = id => document.getElementById(id);
@@ -137,6 +137,10 @@ export function createDownloadDialog(app) {
       filename: name, kind: 'image', mime: 'image/png', download: exp.downloadBlob, canShare: exp.canShareFiles,
     });
     if (out === 'intent') toast('Image saved — attach it to your post on X.');
+    else if (out === 'blocked' || out === 'saved') {
+      // no tab could open (popup blocked, or the share sheet failed after the tap): a fresh tap can
+      toast('Image saved. Open X to post it.', { action: { label: 'Open X', run: () => openXIntent('image') } });
+    }
   });
 
   return {

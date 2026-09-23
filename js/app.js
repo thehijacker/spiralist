@@ -17,7 +17,7 @@ import { loadSettings, saveSettings, clearSettings, savePhoto, loadPhoto, forget
 import { History } from './history.js';
 import { sliderRow, bindSeg, rovingGrid, setChecked, popover, toast, announce, fmtTime, reducedMotion, isTouch, paintRange } from './ui.js';
 import { Thumbs } from './thumbs.js';
-import { drawSeconds, drawProgress } from './film.js';
+import { drawSeconds, drawProgress, signSeconds, warmFilm } from './film.js';
 import { starCount } from './share.js';
 
 const $ = id => document.getElementById(id);
@@ -34,7 +34,7 @@ const DEFAULT_DOC = {
 };
 const DEFAULT_PREFS = {
   theme: 'system', pacing: 'natural', speed: 1, showTool: true,
-  film: { format: isTouch() ? 'story' : 'square', length: 15, showTool: true, polaroid: true, reveal: false },
+  film: { format: isTouch() ? 'story' : 'square', length: 15, showTool: true, polaroid: true, reveal: false, desk: 'nero', signature: '' },
   download: { format: 'png', size: 4096, background: 'paper', svgMode: 'stroke', svgPaper: false },
   visited: false,
 };
@@ -145,7 +145,10 @@ const overlay = $('overlay');
 const octx = overlay.getContext('2d');
 let renderer;
 try {
+  // block: false = never freeze the page for a shader compile (the stage keeps its last image
+  // until the new tool's programs are ready); warmup = compile the other tools in the background
   renderer = new Renderer(art, {
+    block: false, warmup: true, lowMemory: isTouch(),
     onLost: () => toast('Graphics reset — redrawing…'),
     onRestored: () => { thumbs.invalidateAll(); refreshThumbs(); invalidate('geom'); },
   });
@@ -164,8 +167,18 @@ const play = {
   last: 0,
   lift: 1,            // tool lift 0 (drawing) .. 1 (gone)
   scrubbing: false,
+  dryAt: 0,           // when playback reached the end: wet ink then dries on screen (DRY_MS)
 };
-const drawSec = () => drawSeconds(prefs.film.length, prefs.film.reveal);
+// the drawing's share of the film: the transport previews exactly the film's pace
+const drawSec = () => drawSeconds(prefs.film.length, prefs.film.reveal, prefs.film.style, signSeconds(prefs.film.signature));
+// Wet ink dries over this long once the pen lifts, as in the film (a finished still is dry).
+const DRY_MS = 1600;
+function dryness(now) {
+  if (!play.dryAt) return 1;
+  const k = (now - play.dryAt) / DRY_MS;
+  if (k >= 1) { play.dryAt = 0; return 1; }
+  return Math.max(0, k);
+}
 
 function pointIndex(f) {
   if (!geom) return 0;
@@ -176,6 +189,7 @@ function pointIndex(f) {
 function setPlaying(on, { demo = false } = {}) {
   if (on && !photo) return;
   if (on && play.f >= 1) play.f = 0;
+  if (on) play.dryAt = 0;
   play.playing = on;
   play.demo = on && demo;
   play.last = performance.now();
@@ -216,19 +230,28 @@ function tick(now) {
   }
   applyRendererState();
 
-  if (play.playing) {
+  // The tool's programs may still be compiling (on the driver's own threads): keep the last image
+  // and hold the clock rather than freeze the page for them, and look again next frame.
+  const compiling = renderer.pending();
+  $('sheet').classList.toggle('compiling', compiling);
+  if (play.playing && compiling) play.last = now;
+  else if (play.playing) {
     const dt = Math.min(0.1, (now - play.last) / 1000);
     play.last = now;
     const dur = play.demo ? 3 : drawSec() / prefs.speed;
     play.f = Math.min(1, play.f + dt / dur);
-    if (play.f >= 1) { setPlaying(false); busy = false; }
+    if (play.f >= 1) { setPlaying(false); busy = false; if (!play.demo) play.dryAt = now; }
   }
-  if (geom) renderer.render(pointIndex(play.f));
-  else renderer.renderBlank();
+  const drying = play.dryAt > 0 && brush().wetness > 0;
+  if (!compiling) {
+    const upTo = pointIndex(play.f);
+    if (geom) renderer.render(upTo, upTo === Infinity ? { settle: dryness(now) } : undefined);
+    else renderer.renderBlank();
+  }
   drawOverlay(now);
   updateTransport();
-  const animating = play.playing || (play.lift < 1 && play.f >= 1 && prefs.showTool);
-  if (animating || busy) rafId = requestAnimationFrame(tick);
+  const animating = play.playing || drying || (play.lift < 1 && play.f >= 1 && prefs.showTool);
+  if (animating || busy || compiling) rafId = requestAnimationFrame(tick);
   need.render = false;
 }
 
@@ -237,6 +260,8 @@ function applyRendererState() {
   renderer.setLayout(LAYOUT);
   renderer.setPaper(paper(), 1);
   renderer.setStyle({ brush: brush(), ink: doc.ink, cover: m.cover, photoColor: photoColor() });
+  // wet ink spreads and dries with the pacing the transport plays
+  renderer.setPacing(prefs.pacing);
   $('sheet').style.background = paper().color;
 }
 
@@ -569,10 +594,12 @@ function buildTools() {
  *  (or its first light ink on dark paper, so switching tools never makes the line vanish). */
 function inkFor(b, p = paper()) {
   if (doc.inkSource !== 'swatch') return doc.ink;
-  if (b.inks.some(([h]) => h === doc.ink) && !inkMode(b, doc.ink, p).lowContrast && (!p.dark || inkMode(b, doc.ink, p).flip)) return doc.ink;
-  if (!p.dark && !inkMode(b, b.inks[0][0], p).lowContrast) return b.inks[0][0];
+  const reads = h => { const m = inkMode(b, h, p); return !m.lowContrast && (!p.dark || m.flip); };
+  if (b.inks.some(([h]) => h === doc.ink) && reads(doc.ink)) return doc.ink;
+  // the tool's own first ink whenever it reads on this sheet (gold stays gold on black, not silver)
+  const pap = hexToRgb(p.color), first = b.inks[0][0];
+  if (reads(first) && (!p.dark || contrastRatio(hexToRgb(first), pap) >= 2)) return first;
   // otherwise the palette ink that stands out most on this sheet
-  const pap = hexToRgb(p.color);
   return b.inks.reduce((best, [h]) => (contrastRatio(hexToRgb(h), pap) > contrastRatio(hexToRgb(best), pap) ? h : best), b.inks[0][0]);
 }
 /** The paper a tool chip is shown on: the current sheet if the tool has an ink that reads on it,
@@ -950,13 +977,14 @@ function refreshThumbs(photoChanged = false) {
       const fl = m.flip !== !!doc.tone.invert;
       thumbs.add({
         canvas, key: keyOf('look', look.id, photo.id, doc.crop, doc.tone, size, look.line.path || doc.line.path, doc.free), width: size, height: size,
+        needs: { brush: b, paper: p },
         render: r => {
           const rings = Math.max(18, Math.min(look.line.rings, Math.round(size * LAYOUT.r / 2.6)));
           const lineSet = { ...LINE_DEFAULTS, ...look.line, rings, start: 'center' };
           const g = buildPath(look.line.path || doc.line.path, thumbField(fl, rings), lineSet, { ...doc.free, ...look.free }, { draft: true });
           r.setLayout(LAYOUT); r.setPaper(p, 1);
           r.setStyle({ brush: b, ink: look.ink, cover: m.cover, photoColor: false });
-          r.setGeometry(g); r.render(Infinity);
+          r.setGeometry(g); return r.render(Infinity);
         },
       }, look.id === doc.look);
     }
@@ -971,14 +999,18 @@ function refreshThumbs(photoChanged = false) {
     const ink = photoColor() ? b.inks[0][0] : inkFor(b, pp);
     const m = inkMode(b, ink, pp);
     const tech = doc.line.technique === 'wave' ? 'wave' : 'thickness';
+    // wet media: the pen pauses once where the chip shows it, so it pools there and the ink's
+    // shading and bleed read (otherwise fountain ink looks like the pen chip)
+    const gk = b.wetness > 0 ? `${tech}:pause` : tech;
     thumbs.add({
-      canvas, key: keyOf('tool', b.id, pp.id, ink, tech, w, h), width: w, height: h,
+      canvas, key: keyOf('tool', b.id, pp.id, ink, gk, w, h), width: w, height: h,
+      needs: { brush: b, paper: pp },
       render: r => {
-        const g = previewGeoms[tech] || (previewGeoms[tech] = previewStroke({ technique: tech }));
+        const g = previewGeoms[gk] || (previewGeoms[gk] = previewStroke({ technique: tech, pauses: b.wetness > 0 ? [0.55] : [] }));
         // a close-up of the drawing: arcs of the outer rings sweeping across from a corner
         r.setLayout({ cx: -0.05, cy: 1.08 * h / w, r: 1.12 }); r.setPaper(pp, 1);
         r.setStyle({ brush: b, ink, cover: m.cover, photoColor: false });
-        r.setGeometry(g); r.render(Infinity);
+        r.setGeometry(g); return r.render(Infinity);
       },
     });
   }
@@ -992,12 +1024,13 @@ function refreshThumbs(photoChanged = false) {
     const m = inkMode(b, ink, pp);
     thumbs.add({
       canvas, key: keyOf('paper', pp.id, b.id, ink, s), width: s, height: s,
+      needs: { brush: b, paper: pp },
       render: r => {
         const g = previewGeoms.fine || (previewGeoms.fine = previewStroke({ technique: 'thickness', ringsVisible: 9, turns: 2 }));
         r.setLayout({ cx: -0.1, cy: 1.1, r: 1.25 }); r.setPaper(pp, 1);
         r.setStyle({ brush: b, ink, cover: m.cover, photoColor: false });
         r.setGeometry(g);
-        if (m.lowContrast || (b.prefersDark && !pp.dark)) r.renderBlank(); else r.render(Infinity);
+        return m.lowContrast || (b.prefersDark && !pp.dark) ? r.renderBlank() : r.render(Infinity);
       },
     });
   }
@@ -1349,6 +1382,11 @@ async function openDownload(quick = false) {
 }
 $('btnFilm').addEventListener('click', openFilm);
 $('mFilm').addEventListener('click', openFilm);
+// Get the film ready while the pointer or focus is on its button: the scene's compile and the
+// desk's bake start then, so the dialog's preview shows sooner (freed again if it is not opened).
+for (const id of ['btnFilm', 'mFilm']) {
+  for (const ev of ['pointerenter', 'focus']) $(id).addEventListener(ev, () => warmFilm(prefs.film.desk));
+}
 $('btnDownload').addEventListener('click', () => openDownload());
 $('mSave').addEventListener('click', () => openDownload());
 

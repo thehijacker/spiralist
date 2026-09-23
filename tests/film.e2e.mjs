@@ -3,7 +3,11 @@
 //        [--length 10] [--look classic] [--sample bust] [--reveal] [--no-tool]
 //        [--style cinematic|flat] [--fps 30|60] [--maze] [--path maze|wander|contour] [--at x,y]
 //        [--edge] [--pacing natural]   (--at: where a maze / free line starts, circle units)
-//        [--frames intro,25,50,75,end]   (which moments to extract as JPEGs; default all five)
+//        [--desk nero|calacatta|travertine|limewash|velvet|leather|sunlit|onyx]   (the background)
+//        [--frames intro,25,50,75,end]   (which moments to extract as JPEGs; default all five, plus 'sign'
+//        and 'final' (the last frame) when signed)
+//        [--sign "Anna Smith"]   (typed into the dialog's Sign it field: the pen signs the corner)
+//        [--brush watercolour] [--paper coldpress]   (after --look: a tool / paper of their own)
 // Prints the probe (frame count must equal length x fps), the composer's timing
 // (window.__filmLast) and writes shots/e2e_<tag>.mp4 plus shots/e2e_<tag>_<moment>.jpg.
 import { createRequire } from 'node:module';
@@ -21,8 +25,9 @@ const format = opt('format', 'square'), length = +opt('length', 10);
 const style = opt('style', 'cinematic'), fps = +opt('fps', style === 'cinematic' ? 60 : 30);
 const path = opt('path', flag('maze') || opt('maze-at', null) ? 'maze' : 'spiral');
 const maze = path !== 'spiral';
+const desk = opt('desk', null);
 const tag = [browserName, format, `${length}s`, style, `${fps}fps`, maze ? path : flag('edge') ? 'edge' : 'spiral',
-  opt('look', ''), flag('reveal') ? 'reveal' : ''].filter(Boolean).join('_');
+  opt('look', ''), opt('brush', ''), desk || '', flag('reveal') ? 'reveal' : '', opt('sign', null) ? 'signed' : ''].filter(Boolean).join('_');
 const browser = await pw[browserName].launch(browserName === 'chromium'
   ? { headless: true, args: ['--use-angle=d3d11', '--enable-gpu', '--ignore-gpu-blocklist'] } : { headless: true });
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
@@ -33,6 +38,8 @@ await page.goto('http://localhost:8830/');
 await page.waitForFunction(() => window.SP && window.SP.geom && !window.SP.play.playing, null, { timeout: 60000 });
 if (opt('sample', null)) await page.evaluate(id => SP.openSample(id, { demo: false }), opt('sample'));
 if (opt('look', null)) await page.evaluate(id => SP.applyLook(id), opt('look'));
+if (opt('brush', null)) await page.evaluate(id => SP.setBrush(id), opt('brush'));
+if (opt('paper', null)) await page.evaluate(id => SP.setPaper(id), opt('paper'));
 if (maze) {
   const at = (opt('at', opt('maze-at', '')) || '').split(',').map(Number);
   await page.evaluate(({ path, x, y }) => SP.change(d => {
@@ -46,13 +53,21 @@ if (maze) {
   await page.waitForFunction(edge => window.SP.geom && window.SP.geom.path !== 'maze' && window.SP.geom.start === (edge ? 'edge' : 'center'),
     flag('edge'), { timeout: 30000 });
 }
-await page.evaluate(({ format, length, reveal, tool, style, fps, pacing }) => {
+await page.evaluate(({ format, length, reveal, tool, style, fps, pacing, desk }) => {
   const f = SP.prefs.film;
   f.format = format; f.length = length; f.reveal = reveal; f.showTool = tool; f.style = style; f.fps = fps; f.fpsChosen = true;
+  if (desk) f.desk = desk;
   if (pacing) SP.prefs.pacing = pacing;
-}, { format, length, reveal: flag('reveal'), tool: !flag('no-tool'), style, fps, pacing: opt('pacing', null) });
+}, { format, length, reveal: flag('reveal'), tool: !flag('no-tool'), style, fps, pacing: opt('pacing', null), desk });
+await page.evaluate(() => { SP.prefs.film.signature = ''; });
 await page.evaluate(() => SP.openFilm());
 await page.waitForFunction(() => !document.getElementById('filmGo').disabled && document.getElementById('filmSummary').textContent, null, { timeout: 30000 });
+if (opt('sign', null)) {
+  // typed like a person would, into the real field (it persists as prefs.film.signature)
+  await page.fill('#filmSign', '');
+  await page.type('#filmSign', opt('sign'), { delay: 20 });
+  await page.waitForTimeout(700);
+}
 await page.waitForTimeout(600);
 const summary = await page.textContent('#filmSummary');
 if (flag('dialog-shot')) await page.locator('#filmDialog').screenshot({ path: `shots/e2e_${tag}_dialog.png` });
@@ -87,13 +102,19 @@ if (ok && !(await page.isHidden('#filmResult'))) {
       duration: +probe.format?.duration, durationOk: Math.abs(+probe.format?.duration - length) < 0.05, level: st.level };
   } catch (e) { probe = { error: String(e.message) }; }
   // the intro close-up, the quarters of the drawing, and the final reveal
-  const moments = { intro: 0.35, 25: length * 0.25, 50: length * 0.5, 75: length * 0.75, end: Math.max(0, length - 0.3) };
-  const want = (opt('frames', 'intro,25,50,75,end')).split(',');
+  const moments = { intro: 0.35, 25: length * 0.25, 50: length * 0.5, 75: length * 0.75, end: Math.max(0, length - 0.3),
+    sign: timing?.sign ? timing.sign.t0 + 0.7 * (timing.sign.t1 - timing.sign.t0) : null, final: length - 1 / fps / 2 };
+  const want = (opt('frames', opt('sign', null) ? 'intro,25,50,75,end,sign,final' : 'intro,25,50,75,end')).split(',');
   for (const name of want) {
     const t = moments[name] ?? +name;
-    try { execFileSync('ffmpeg', ['-v', 'error', '-y', '-ss', String(t), '-i', file, '-frames:v', '1', '-q:v', '3', file.replace(/\.\w+$/, `_${name}.jpg`)]); } catch { /* ignore */ }
+    if (t == null || !Number.isFinite(t)) continue;
+    const out = file.replace(/\.\w+$/, `_${name}.jpg`);
+    // 'final': decode the last 0.2 s and keep overwriting, so the file ends as the very last frame
+    const a = name === 'final' ? ['-sseof', '-0.2', '-i', file, '-update', '1', '-q:v', '3', out]
+      : ['-ss', String(t), '-i', file, '-frames:v', '1', '-q:v', '3', out];
+    try { execFileSync('ffmpeg', ['-v', 'error', '-y', ...a]); } catch { /* ignore */ }
   }
 }
-console.log(JSON.stringify({ browser: browserName, format, length, style, fps, maze, path, summary, secs, meta, toast: toastText, file, check, timing, probe: probe?.streams?.[0] }, null, 1));
+console.log(JSON.stringify({ browser: browserName, format, length, style, fps, maze, path, desk, summary, secs, meta, toast: toastText, file, check, timing, probe: probe?.streams?.[0] }, null, 1));
 if (logs.length) console.log(logs.slice(0, 30).join('\n'));
 await browser.close();

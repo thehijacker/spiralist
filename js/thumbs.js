@@ -2,6 +2,10 @@
 // offscreen Renderer — a context per chip would exhaust the browser's WebGL context budget — then
 // copied into a plain 2D canvas. Jobs run one per idle slice; a job whose key already matches its
 // canvas is skipped, and a new generation of jobs for the same canvas replaces the old one.
+//
+// The renderer never waits for a shader compile (block: false): a chip whose tool still compiles
+// goes back in line with its skeleton showing, and the page keeps responding. Once the queue has
+// been empty for a while the wet grid is freed, so idle chips hold no simulation memory.
 
 import { Renderer } from './renderer.js';
 
@@ -17,7 +21,10 @@ export class Thumbs {
   _ensure() {
     if (this.renderer || this.failed) return this.renderer;
     try {
+      // keepCanvas: chips of different sizes share one canvas (resizing a WebGL canvas waits for
+      // all queued GPU work, hundreds of ms while programs compile); each is its bottom-left corner
       this.renderer = new Renderer(this.canvas, {
+        block: false, keepCanvas: true, lowMemory: true,
         onLost: () => { this.lostAt = performance.now(); },
         onRestored: () => this.invalidateAll(),
       });
@@ -26,8 +33,9 @@ export class Thumbs {
   }
 
   /**
-   * job: { canvas, key, width, height, render(renderer) -> boolean }
+   * job: { canvas, key, width, height, needs: { brush, paper }, render(renderer) -> boolean | 'pending' }
    * `render` configures the renderer (size already set) and returns false to skip drawing.
+   * `needs` (optional) lets a chip wait for its programs before it builds anything.
    * `priority` jobs jump the queue.
    */
   add(job, priority = false) {
@@ -55,18 +63,25 @@ export class Thumbs {
       const r = this._ensure();
       if (!r) { this.running = false; return; }
       const t0 = performance.now();
+      const waiting = [];
       while (this.queue.size && (performance.now() - t0 < 12 || deadline.timeRemaining() > 4)) {
         const [canvas, job] = this.queue.entries().next().value;
         this.queue.delete(canvas);
         if (!canvas.isConnected || canvas.dataset.key === job.key) continue;
+        // its tool's programs are still compiling (off this thread): try again shortly. Only the
+        // first few waiting chips may start compiles: the driver's compile threads are shared with
+        // the stage and the film, and a flood of chips would queue in front of them.
+        if (job.needs && r.pending(job.needs.brush, job.needs.paper, waiting.length < 2)) { waiting.push([canvas, job]); continue; }
         try {
           r.setSize(job.width, job.height);
-          if (job.render(r) === false) continue;
+          const out = job.render(r);
+          if (out === 'pending') { waiting.push([canvas, job]); continue; }
+          if (out === false) continue;
           if (canvas.width !== job.width) canvas.width = job.width;
           if (canvas.height !== job.height) canvas.height = job.height;
           const g = canvas.getContext('2d');
           g.clearRect(0, 0, canvas.width, canvas.height);
-          g.drawImage(r.canvas, 0, 0);
+          g.drawImage(r.canvas, 0, r.canvas.height - job.height, job.width, job.height, 0, 0, job.width, job.height);
           canvas.dataset.key = job.key;
           canvas.parentElement?.querySelector('.skeleton')?.remove();
         } catch (e) {
@@ -74,8 +89,18 @@ export class Thumbs {
         }
         if (performance.now() - t0 > 40) break;
       }
-      if (this.queue.size) idle(step);
-      else this.running = false;
+      // back in line behind the rest (a newer job for the same canvas, added meanwhile, wins)
+      for (const [c, j] of waiting) if (!this.queue.has(c)) this.queue.set(c, j);
+      if (!this.queue.size) {
+        this.running = false;
+        // idle for a while (not between the bursts of one Look or tool switch): free the grid
+        clearTimeout(this.freeTimer);
+        this.freeTimer = setTimeout(() => { if (!this.running) r.freeSim(); }, 8000);
+      } else if (waiting.length && waiting.length >= this.queue.size) {
+        setTimeout(() => idle(step), 50);   // only compiling chips left: poll, don't spin
+      } else {
+        idle(step);
+      }
     };
     idle(step);
   }
